@@ -241,8 +241,9 @@ void gameSave(u8* p)
     u32 rooms[4] = { 0x10 + 3 * 0xD8, 3, 0, 0 };
     memset(p + kSaveRoom, 0, 0xE7D0 - kSaveRoom);
     memcpy(p + kSaveRoom, rooms, sizeof(rooms));
-    u16 roomNo = 0x0120;
-    memcpy(p + kSaveRoom + 0x10 + 0xD8, &roomNo, 2);
+    // the second record's id as cRoomData::init writes it on every host: [0] stage, [1] room (r120)
+    p[kSaveRoom + 0x10 + 0xD8] = 0x01;
+    p[kSaveRoom + 0x10 + 0xD8 + 1] = 0x20;
     MERCHANT_DATA* m = (MERCHANT_DATA*) (p + kSaveMerchant);
     memset(m, 0, sizeof(*m));
     m->stock.e[0].id = 0x0035;
@@ -375,7 +376,8 @@ void gciTest(const char* path)
     CHECK(be32At(d + g + offsetof(GLOBAL_WK, pl_pos)) == xBits);
     CHECK(be16At(d + kSaveItem + offsetof(_ITEM_SAVE_DATA, arm_no)) == 0x0102);
     CHECK(be16At(d + kSaveItem + offsetof(_ITEM_SAVE_DATA, item_list)) == 0x8023);
-    CHECK(be32At(d + kSaveRoom + 4) == 3 && be16At(d + kSaveRoom + 0x10 + 0xD8) == 0x0120);
+    // the record id goes over as its two bytes (stage, room), not as a u16 (09.11.2026: turned, r201 became r102)
+    CHECK(be32At(d + kSaveRoom + 4) == 3 && d[kSaveRoom + 0x10 + 0xD8] == 0x01 && d[kSaveRoom + 0x10 + 0xD8 + 1] == 0x20);
     CHECK(be16At(d + kSaveMerchant) == 0x0035);
     CHECK(memcmp(d + 0x40, save + 0x40, 0x1E00) == 0);  // banner, icon, palette: as they were
     CHECK(be32At(d + 0x2000) == CRCCalc((u8*) d + 0x2004, 0x1FC));
@@ -403,6 +405,14 @@ void gciTest(const char* path)
     other[8 + 9] = '1';
     CHECK(re4_gci_import(other, sizeof(other), 0, note, sizeof(note)) == RE4_CARD_OK);
     CHECK(re4_card_free_blocks() == 251 - 17);
+    // a save of the European release (G4BP08, the same form): over it, kept as G4BE08
+    memcpy(other, "G4BP", 4);
+    CHECK(re4_gci_import(other, sizeof(other), 1, note, sizeof(note)) == RE4_CARD_OK);
+    CHECK(re4_card_free_blocks() == 251 - 17);
+    n = re4_card_list(files, 8);
+    int eu = findFile(files, n, "bh4_data01");
+    CHECK(eu >= 0 && files[eu].intact && re4_gci_file_name(files[eu].index, name, sizeof(name)) == RE4_CARD_OK
+          && strcmp(name, "08-G4BE-bh4_data01.gci") == 0);
     // refused: another game, cut short, a wrong CRC, another version
     memcpy(other, gci, sizeof(gci));
     memcpy(other, "GZLE", 4);

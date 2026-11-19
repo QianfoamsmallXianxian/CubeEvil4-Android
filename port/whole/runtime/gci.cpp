@@ -52,6 +52,12 @@ const u32 kSaveHeader = 0x2000, kSaveGlobalAt = 0x2034, kSaveItemAt = 0x572C, kS
           kSaveBytes = 0xEAFC, kSaveVersion = 0x116;
 const u32 kSystemWork = 0x1E40, kSystemCrc = 0x1E78, kSystemBytes = 0x1E7C;
 const char kGame[] = "G4BE", kCompany[] = "08";
+// The European release's saves (G4BP08): its makeSaveData / cGameSave::save (main.dol 0x80009bac,
+// 0x8011a064) write version 0x116 with the same parts at the same places and sizes; its GLOBAL_WK
+// keeps the saved block 0xC bytes later (0x4F8C), but the block inside is the same (every access
+// of pG in the block lies 0xC further, 30.10.2026). Taken over as G4BE08, the id the game sees with
+// every disc (dvd.cpp).
+const char kGameEu[] = "G4BP";
 // the save header: CRC, version, OSCalendarTime (10 words), mode
 const Re4SaveRun kSaveHeaderRuns[] = {{0, 4, 13}};
 
@@ -126,6 +132,24 @@ template <size_t N> void turnRuns(u8* base, const Re4SaveRun (&runs)[N])
     for (const Re4SaveRun& r : runs) {
         for (unsigned k = 0; k < r.count; k++) {
             turn(base + r.offset + k * r.size, r.size);
+        }
+    }
+}
+
+// One room record (ROOM_SAVE_DATA) without its id: RoomNo is the u16 of a union, but cRoomData::init
+// writes it byte by byte ([0] stage, [1] room) on every host and cRoomData::load / clear only compare
+// it whole, so in the port it is the GameCube's two bytes and stays as it is. Turned as a u16 (up to
+// 0.99.6) an imported save had every id as room, stage: 109 of the 121 records found no room and four
+// pairs swapped theirs (r102 with r201 and so on: the Garrador in r201 hung on his chains for good, the
+// prison key counted as taken, 09.11.2026); an exported one did the same to the GameCube's game.
+void turnRoomRecord(u8* rec)
+{
+    for (const Re4SaveRun& r : kSaveRoom) {
+        if (r.offset == 0 && r.size == 2 && r.count == 1) {
+            continue;  // RoomNo
+        }
+        for (unsigned k = 0; k < r.count; k++) {
+            turn(rec + r.offset + k * r.size, r.size);
         }
     }
 }
@@ -236,7 +260,7 @@ int re4_gci_convert(const char* name, unsigned char* data, unsigned bytes, int t
     turnRuns(data + kSaveItemAt, kSaveItem);
     turnRuns(data + kSaveRoomAt, kSaveRoomHeader);
     for (u32 i = 0; i < rooms; i++) {
-        turnRuns(data + kSaveRoomAt + kSaveRoomHeaderSize + i * kSaveRoomSize, kSaveRoom);
+        turnRoomRecord(data + kSaveRoomAt + kSaveRoomHeaderSize + i * kSaveRoomSize);
     }
     turnRuns(data + kSaveSscrnAt, kSaveSscrn);
     turnRuns(data + kSaveMerchantAt, kSaveMerchant);
@@ -328,10 +352,14 @@ int re4_gci_import(const unsigned char* gci, unsigned size, int replace, char* n
         say(note, noteSize, "%s: says %u blocks, the file holds %u bytes", name, blocks, size - RE4_GCI_HEADER);
         return RE4_CARD_BAD;
     }
-    if (memcmp(entry, kGame, 4) != 0 || memcmp(entry + 4, kCompany, 2) != 0) {
-        say(note, noteSize, "%s: a file of another game (%.4s%.2s, this one is %s%s)", name, (const char*) entry,
-            (const char*) entry + 4, kGame, kCompany);
+    bool european = memcmp(entry, kGameEu, 4) == 0;
+    if ((memcmp(entry, kGame, 4) != 0 && !european) || memcmp(entry + 4, kCompany, 2) != 0) {
+        say(note, noteSize, "%s: a file of another game (%.4s%.2s, this one is %s%s or %s%s)", name,
+            (const char*) entry, (const char*) entry + 4, kGame, kCompany, kGameEu, kCompany);
         return RE4_CARD_BAD;
+    }
+    if (european) {
+        memcpy(entry, kGame, 4);
     }
     u8* data = (u8*) malloc(blocks * RE4_CARD_BLOCK);
     if (!data) {
@@ -349,7 +377,7 @@ int re4_gci_import(const unsigned char* gci, unsigned size, int replace, char* n
         } else if (r != RE4_CARD_OK) {
             say(note, noteSize, "%s: writing failed (%d)", name, r);
         } else {
-            re4_log("gci: %s imported (%u blocks)", name, blocks);
+            re4_log("gci: %s imported (%u blocks%s)", name, blocks, european ? ", European G4BP08 as G4BE08" : "");
         }
     }
     free(data);

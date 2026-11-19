@@ -728,8 +728,17 @@ int re4_valid_port_ptr(const void* p)
     }
     // the libraries of the game (libre4_main, libre4_<module>): the spans
     // found so far, else the loader's list
+    // A module library unloaded since (re4_module_unload: dlclose, its range
+    // unmapped) leaves no span: a stale one let a dangling model pointer of a
+    // room being replaced pass the state bridge's check (SIGSEGV in
+    // captureModel at 0xba900018, moto g54, r30a -> r309, report 20261103-234848).
     static uintptr_t spans[256][2];
     static int spanCount;
+    static unsigned unloadsSeen;
+    if (unloadsSeen != re4_module_unloads()) {
+        unloadsSeen = re4_module_unloads();
+        spanCount = 0;
+    }
     uintptr_t a = (uintptr_t) p;
     for (int i = 0; i < spanCount; i++) {
         if (a >= spans[i][0] && a < spans[i][1]) {
@@ -746,24 +755,22 @@ int re4_valid_port_ptr(const void* p)
             if (!info->dlpi_name || !strstr(info->dlpi_name, "libre4_")) {
                 return 0;
             }
-            uintptr_t lo = UINTPTR_MAX, hi = 0;
+            // each readable segment on its own: the linker reserves the whole range of a library
+            // and leaves the gaps between its segments PROT_NONE ("---p"); a pointer into such a
+            // gap passed when the check took the library from its lowest to its highest segment
+            // (SIGSEGV SEGV_ACCERR in the state bridge, reports of 08.11.2026)
             for (int i = 0; i < info->dlpi_phnum; i++) {
                 const ElfW(Phdr)& ph = info->dlpi_phdr[i];
-                if (ph.p_type == PT_LOAD) {
-                    uintptr_t b = info->dlpi_addr + ph.p_vaddr;
-                    if (b < lo) {
-                        lo = b;
-                    }
-                    if (b + ph.p_memsz > hi) {
-                        hi = b + ph.p_memsz;
-                    }
+                if (ph.p_type != PT_LOAD || !(ph.p_flags & PF_R)) {
+                    continue;
                 }
-            }
-            if (s->address >= lo && s->address < hi) {
-                s->begin = lo;
-                s->end = hi;
-                s->found = true;
-                return 1;
+                uintptr_t b = info->dlpi_addr + ph.p_vaddr;
+                if (s->address >= b && s->address < b + ph.p_memsz) {
+                    s->begin = b;
+                    s->end = b + ph.p_memsz;
+                    s->found = true;
+                    return 1;
+                }
             }
             return 0;
         },

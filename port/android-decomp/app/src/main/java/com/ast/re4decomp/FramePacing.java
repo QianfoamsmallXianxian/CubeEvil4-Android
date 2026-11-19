@@ -12,6 +12,18 @@ import java.util.Arrays;
  * vsyncs (Choreographer), not from the pictures drawn: a slow GPU does not
  * change it. Independent of Android so the host tests can check it
  * (tests/FramePacingTests.java).
+ *
+ * The beat (due(), 0.98.5): the vsyncs are counted from their times on the
+ * display's grid, not from the callbacks. Choreographer delivers a callback
+ * that comes a vsync late or more once, for the newest vsync; counted as one,
+ * it moved the beat and left a picture out each time. The tester's Xiaomi
+ * (120 Hz, every second vsync) lost up to 8 pictures a second while the touch
+ * controls were shown (report 06.11.2026, a controller connected; the cause
+ * most likely the UI thread, where the beat ran until then and where
+ * RetroTouch redraws the controls at each vsync while a finger moves, with or
+ * without a controller). The beat now runs on a thread of its own
+ * (CoreActivity), the count by time covers what is still late there. step() alone counts for a thread that only watches (the UI
+ * thread's lateness, for the log).
  */
 final class FramePacing {
   /** Vsync intervals per measurement; their median is the display's period (a late callback does not count). */
@@ -20,8 +32,14 @@ final class FramePacing {
   private final long[] deltas = new long[WINDOW];
   private int count;
   private long last = Long.MIN_VALUE;
-  private int every = 1, candidate = 1;
-  private double hz;
+  // written by the beat's thread, read by the UI thread (the menu's line, the FPS display)
+  private volatile int every = 1;
+  private int candidate = 1;
+  private volatile double hz;
+  // the beat: the vsync of the last step, the vsyncs counted since the start; the counts for the log
+  private long stepAt = Long.MIN_VALUE;
+  private long beat;
+  private int callbacks, late, missed;
 
   /** The pictures for a display of `hz`: every n-th vsync, n the most that still gives 59.94 a second. */
   static int everyFor(double hz) {
@@ -33,7 +51,7 @@ final class FramePacing {
    * every() changed: the same new value from two measurements in a row (a
    * screen that changes its rate settles first).
    */
-  boolean vsync(long nanos) {
+  synchronized boolean vsync(long nanos) {
     final long previous = last;
     last = nanos;
     if (previous == Long.MIN_VALUE || nanos <= previous) return false;
@@ -56,15 +74,76 @@ final class FramePacing {
     return true;
   }
 
+  /**
+   * 0.99.9 (frame pacing): whether 60 pictures a second cannot be shown evenly on a display of `hz` while 30 can (90
+   * Hz: 60 alternates one and two vsyncs, 30 is three each): the menu then suggests 30 (60 FPS off). Unknown: false.
+   */
+  static boolean sixtyUneven(double hz) {
+    if (!(hz > 0)) return false;
+    final double sixty = hz / 59.94, thirty = hz / 29.97;
+    return Math.abs(sixty - Math.round(sixty)) > 0.03 && Math.abs(thirty - Math.round(thirty)) <= 0.03;
+  }
+
   /** Draw at every n-th vsync (1: at each). */
   int every() { return every; }
 
   /** The display's rate from the last measurement, 0 before the first. */
   double hz() { return hz; }
 
+  /**
+   * The callback of the vsync at `nanos`: the vsyncs since the one before (at least 1), from
+   * their times with the measured rate (1 a callback until the first measurement). A callback
+   * for the same vsync again or an older one is 0, and so (1.0.0) is one less than half a vsync
+   * after the one before: a user's Xiaomi (120 Hz LTPO, the 60 Hz mode asked for but not taken)
+   * reported a vsync now and then a fraction of a vsync off the grid; counted as one it moved the
+   * beat by a vsync, and the next picture came a vsync early. The beat stays at the last one.
+   */
+  synchronized int step(long nanos) {
+    final long before = stepAt;
+    if (before != Long.MIN_VALUE && nanos <= before) return 0;
+    final double rate = hz;
+    int n = 1;
+    if (before != Long.MIN_VALUE && rate > 0) {
+      final long counted = Math.round((nanos - before) * rate / 1e9);
+      if (counted < 1) return 0;
+      n = (int) Math.min(1000, counted);
+    }
+    stepAt = nanos;
+    beat += n;
+    callbacks++;
+    if (n > 1) {
+      late++;
+      missed += n - 1;
+    }
+    return n;
+  }
+
+  /**
+   * After vsync(nanos), with the same time: the picture is due at this vsync (every() > 1),
+   * once each every() vsyncs counted by step(). A late callback whose slot has not had its
+   * picture yet still requests it, at once.
+   */
+  synchronized boolean due(long nanos) {
+    final long before = beat;
+    if (step(nanos) == 0) return false;
+    final int e = every;
+    return e > 1 && beat / e != before / e;
+  }
+
+  /**
+   * The counts since the last call, then zero: callbacks, those late by a vsync or more, the
+   * vsyncs they missed.
+   */
+  synchronized int[] takeCounts() {
+    final int[] out = {callbacks, late, missed};
+    callbacks = late = missed = 0;
+    return out;
+  }
+
   /** The app went away (pause): the next vsync starts a new interval. */
-  void restart() {
+  synchronized void restart() {
     last = Long.MIN_VALUE;
     count = 0;
+    stepAt = Long.MIN_VALUE;
   }
 }

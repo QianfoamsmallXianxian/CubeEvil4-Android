@@ -8,7 +8,11 @@
 //  - the game runs its main loop (gameMainLoop), no sub screen, no event;
 //  - the player's routine is the weapon's (r_no_0 0, r_no_1 6: pl_R1_Weapon),
 //    not the knife (PlGetWeaponNo 0x10: the knife routine, L held, or the
-//    knife as the equipped weapon);
+//    knife as the equipped weapon); or the knife stance (wish of the project
+//    owner, 10.11.2026, 0.99.9: "Touch Aiming" for the knife too): routine
+//    0/0xB (PlKnifeMove), holding it or slashing (r_no_2 1, 2), where its
+//    PlWepLockCtrl reads the stick as the guns' does, turned as the gun is
+//    below (the body's yaw, m3r with the sway's centre);
 //  - with the scope (STA_SCOPE_CAMERA, CamCtrl.r0 0x10: rifles, the rocket and
 //    mine launchers) the body's yaw and the scope's pitch (CameraScope
 //    angle_x, negative is up, kept within its limits), less at a higher zoom
@@ -18,11 +22,37 @@
 //    and the aim's pitch (m3r, -1..1 for -45..45 degrees, positive is up)
 //    together with the centre of the sway (cPlWep::pitch, m3r * PI/2):
 //    PlWepLockRand pulls m3r back to that centre on the frames the stick
-//    rests. A started auto aim (lock-on option, cPlWep::m_LockTime) ends.
+//    rests. A started auto aim (lock-on option, cPlWep::m_LockTime) ends;
+//    a turn below kLockKeep a frame leaves it running (and turns nothing).
+//
+// The harpoon in the boat of the Del Lago fight too (wish of the project owner, 23.10.2026): while
+// the player aims it (pl0f plboat_R2_SpearSet / SpearSet2, routine 0/0xF/3 or 0/0xF/0xA, step 3,
+// where PLBOAT_AIM_CONTROL reads the stick) the yaw moves the sight across (m_BoatPlDir, -22.5 ..
+// 22.5 degrees, positive left; at the limits the boat turns, as with the stick) and the pitch up
+// and down (m_Blend, -255 .. 255, positive up), as many pixels of the sight per degree up and
+// down as across (plboatSightCurGet: 488.92 pixels per radian across, 0.390625 per unit up).
 //
 // The first port's gain: 35 % of the device's turn, at 30 game frames a
 // second (main.cpp SetSystemVcnt(2)). A rate older than 150 ms counts as none
 // (the app stopped sending).
+//
+// Swipe aiming (re4_core_aim_turn; the menu's "Touch Aiming: Touch Area", user report and wish of the
+// project owner, 29.10.2026: as in mobile shooters, the aim follows the finger and stops when it
+// stops, no stick that keeps turning): the app hands each finger movement over as angles, summed up
+// to the next game frame and turned there all at once, on the same ways as the gyro (the scope's
+// zoom too), with no gain; the knife stance too (0.99.9; the gyro leaves the knife alone, as before).
+//
+// Turning Leon (re4_core_body_turn; 1.0, a player's wish the project owner took, 16.11.2026: "being able to change
+// directions immediately through the look area", as the PC version's mouse turning mods): with the app's option the
+// mouse's and the touch look zone's movement sideways, as angles, turns Leon himself, summed up to the next game frame
+// and added to his yaw there (pPL->ang.y, positive left), smoothly, his tank controls as they are. Only while the game
+// runs its main loop, no sub screen, no event, the keys not stopped (SPF_KEY), neither the scope nor the binoculars
+// up, and the player in his own movement
+// routines 0/0..4 (standing, walking, walking back, running, turning on the spot: Pl_func_move_tbl): not while he
+// aims or holds the knife (the aim turns there, above), not in the quick turn, on a ladder, jumping, falling, in the
+// boat, crouching, pushing, nor in damage, grabs, death or scripted routines (r_no_0 not 0). Ashley's part too (the
+// same routines). A turn there is gone. Standing still the game does not tell its camera where the player faces
+// (cPlayer::move: `moved` 0); patch 0234 asks re4_body_turned, so the camera follows the turn as it does a walk.
 #include "types.h"
 #include "global.h"
 #include "em.h"
@@ -33,6 +63,10 @@
 #include "cam_ctrl.h"
 #include "cam_extra.h"
 
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 extern GLOBAL_WK* pG;
@@ -40,17 +74,32 @@ extern cPlayer* pPL;
 
 extern "C" void re4_log(const char* fmt, ...);
 extern "C" void re4_add_frame_hook(void (*hook)(unsigned));
+extern "C" int re4_binocular_look(float yaw, float pitch);  // runtime/wheel_zoom.cpp
+extern "C" long re4_trace_free_at(void);                     // runtime/state_trace.cpp
 
 namespace {
 
 const float kGain = 0.35f;
 const float kFrame = 1.0f / 30.0f;
 const float kPi = 3.14159265f;
+const float kBoatDir = 0.3926991f;                  // the harpoon sight's limit across (pl0f)
+const float kBoatBlend = 488.92398f / 0.390625f;    // m_Blend units per radian up, for the same pixels
+const float kLockKeep = 0.003f;                     // radians a frame (about 5 degrees a second of the aim at 30 frames)
 
 // the app's thread writes, the game's reads: the floats as bits, and when (ms)
 volatile u32 gYawBits, gPitchBits, gWhen;
 bool gHooked;
 unsigned gTurned;  // frames the gyro turned the aim (the log)
+// the swipe's angles since the last game frame (re4_core_aim_turn; the app's thread adds them)
+volatile u32 gSwipeLock;
+float gSwipeYaw, gSwipePitch;
+unsigned gSwiped;  // frames a swipe turned the aim (the log)
+unsigned gSwipedKnife;  // ... the knife's (the log)
+// Leon's turn since the last game frame (re4_core_body_turn; under the swipe's lock), whether this frame turned him
+// (re4_body_turned, patch 0234), the frames it did (the log)
+float gBodyYaw;
+bool gBodyTurned;
+unsigned gBodyFrames;
 
 u32 nowMs()
 {
@@ -73,8 +122,200 @@ float value(u32 b)
     return f;
 }
 
-void gyroHook(unsigned)
+void lockSwipe()
 {
+    while (__atomic_exchange_n(&gSwipeLock, 1u, __ATOMIC_ACQUIRE)) {
+    }
+}
+
+void unlockSwipe()
+{
+    __atomic_store_n(&gSwipeLock, 0u, __ATOMIC_RELEASE);
+}
+
+// Turns the aim by yaw (positive left) and pitch (positive up), in radians, where the player aims;
+// false: not aiming (nothing turned). knifeToo: the knife stance as well (the swipe and the mouse, not the gyro)
+bool turnAim(float yaw, float pitch, bool knifeToo)
+{
+    cPlayer* pl = pPL;
+    if (!pG || !pl || pG->Rno0 != 3 || StaFlagChk(pG, STA_SUB_SCRN) || StaFlagChk(pG, STA_EVENT)) {
+        return false;
+    }
+    if (pl->r_no_0 == 0 && pl->r_no_1 == 0xF && (pl->r_no_2 == 3 || pl->r_no_2 == 0xA) && pl->r_no_3 == 3 &&
+        pl->m_pBoat) {
+        const float d = yaw;
+        float dir = pl->m_BoatPlDir + d;
+        if (dir > kBoatDir) {
+            dir = kBoatDir;
+            pl->m_pBoat->ang.y += d;
+        }
+        if (dir < -kBoatDir) {
+            dir = -kBoatDir;
+            pl->m_pBoat->ang.y += d;
+        }
+        pl->m_BoatPlDir = dir;
+        float blend = pl->m_Blend + pitch * kBoatBlend;
+        if (blend > 255.0f) blend = 255.0f;
+        if (blend < -255.0f) blend = -255.0f;
+        pl->m_Blend = blend;
+        return true;
+    }
+    if (!pl->Wep || pl->r_no_0 != 0) {
+        return false;
+    }
+    // the knife stance (0.99.9): its routine reads the stick as the guns do (PlWepLockCtrl: m3r, the body's yaw)
+    const bool knife = knifeToo && pl->r_no_1 == 0xB && (pl->r_no_2 == 1 || pl->r_no_2 == 2);
+    if (!knife && (pl->r_no_1 != 6 || PlGetWeaponNo() == 0x10)) {
+        return false;
+    }
+    if (!knife && StaFlagChk(pG, STA_SCOPE_CAMERA) && CamCtrl.r0 == 0x10 && CamCtrl.m_pProc) {
+        CameraScope* scope = (CameraScope*) CamCtrl.m_pProc;
+        f32 zoom = 0.0f, angle = 0.0f;
+        scope->getParam(&zoom, &angle);
+        const float gain = 1.0f - 0.9f * zoom;
+        pl->ang.y += yaw * gain;
+        float x = scope->angle_x - pitch * gain;
+        if (x < scope->angle_min) x = scope->angle_min;
+        if (x > scope->angle_max) x = scope->angle_max;
+        scope->angle_x = x;
+    } else if (knife || pl->r_no_2 == 1 || pl->r_no_2 == 2) {
+        // the app's auto aim (a user's report, 01.11.2026: the laser above the head): for the 10 frames the
+        // gun follows its target (cPlWep::m_LockTime) a hand's small unrest (below kLockKeep a frame) neither
+        // turns the aim nor ends the lock; a real turn does both
+        if (pl->Wep->m_LockTime != 0 && fabsf(yaw) < kLockKeep && fabsf(pitch) < kLockKeep) {
+            return true;
+        }
+        pl->ang.y += yaw;
+        const f32 before = m3r;
+        m3r += pitch / (kPi / 4.0f);
+        m3r.limit(-1.0f, 1.0f);
+        pl->Wep->pitch += ((f32) m3r - before) * (kPi / 2.0f);
+        pl->Wep->m_LockTime = 0;
+    } else {
+        return false;
+    }
+    return true;
+}
+
+// Turns Leon by yaw (radians, positive left) where his own movement allows it; else a reason why not (the log)
+const char* turnBody(float yaw)
+{
+    cPlayer* pl = pPL;
+    if (!pG || !pl || pG->Rno0 != 3) {
+        return "not in play";
+    }
+    if (StaFlagChk(pG, STA_SUB_SCRN)) {
+        return "sub screen";
+    }
+    if (StaFlagChk(pG, STA_EVENT)) {
+        return "event";
+    }
+    if (SpfFlagChk(pG, SPF_KEY)) {
+        return "keys stopped";
+    }
+    if (StaFlagChk(pG, STA_SCOPE_CAMERA) || StaFlagChk(pG, STA_BINOCULAR)) {
+        return "scope or binoculars";  // (the movement looks around there: re4_binocular_look, turnAim)
+    }
+    if (pl->r_no_0 != 0 || pl->r_no_1 > 4) {
+        return "routine";
+    }
+    pl->ang.y += yaw;
+    return 0;
+}
+
+// For tests on the PC: RE4_TEST_GYRO="yaw,pitch", the device's turn rates (rad/s) as the app would send them,
+// all the time (a hand's unrest while aiming: the auto aim, patch 0174)
+bool gTest;
+// RE4_TEST_SWIPE="yaw,pitch,from,to" (0.99.9): a swipe of yaw, pitch radians at each game frame from .. to (the
+// PADRead count), as the app's re4_core_aim_turn; RE4_TRACE_AIM=1: one "aim:" line a frame while the player holds
+// the knife or a gun (his routine, the body's yaw, the waist's turn, m3r)
+float gTestSwipe[2];
+unsigned gTestSwipeFrom = 1, gTestSwipeTo;
+bool gTraceAim;
+unsigned gAimLines;
+// RE4_TEST_TURN="yaw,from,to[;yaw,from,to...]" (1.0): Leon turned by yaw radians at each game frame from .. to frames
+// after the player is free (runtime/state_trace.cpp; "a" before yaw: from .. to are the PADRead count, before he is
+// free too, the room's start and its events), as the app's re4_core_body_turn; RE4_TEST_LADDER="N,level": N
+// frames after the player is free he is put on a ladder where he stands (PlSetLadder, level 3 one rung up), to see
+// that it does not turn him there; RE4_TRACE_TURN=1: one "turn:" line a frame a turn came (his routine, his yaw, done or
+// why not)
+struct TestTurn {
+    float yaw;
+    long from, to;
+    bool absolute;
+};
+TestTurn gTestTurn[8];
+int gTestTurns;
+long gTestLadder = -1;
+int gTestLadderLevel = 3;
+bool gTraceTurn;
+unsigned gTurnLines;
+
+void gyroHook(unsigned frame)
+{
+    if (gTest) {
+        __atomic_store_n(&gWhen, nowMs(), __ATOMIC_RELAXED);
+    }
+    if (frame >= gTestSwipeFrom && frame <= gTestSwipeTo) {
+        lockSwipe();
+        gSwipeYaw += gTestSwipe[0];
+        gSwipePitch += gTestSwipe[1];
+        unlockSwipe();
+    }
+    if (gTraceAim && pPL && pG && pG->Rno0 == 3 && pPL->r_no_0 == 0 && (pPL->r_no_1 == 0xB || pPL->r_no_1 == 6) &&
+        gAimLines < 4000) {
+        gAimLines++;
+        // (the state the frame before left, before this frame's swipe)
+        re4_log("aim: frame %u pl %u/%u/%u/%u ang %.4f waist %.4f m3r %.4f", frame, (unsigned) pPL->r_no_0,
+                (unsigned) pPL->r_no_1, (unsigned) pPL->r_no_2, (unsigned) pPL->r_no_3, (double) pPL->ang.y,
+                (double) pPL->m_Fwork0, (double) (f32) m3r);
+    }
+    const long freeAt = re4_trace_free_at();
+    for (int i = 0; i < gTestTurns; i++) {
+        const long base = gTestTurn[i].absolute ? 0 : freeAt;
+        if (base >= 0 && (long) frame >= base + gTestTurn[i].from && (long) frame <= base + gTestTurn[i].to) {
+            lockSwipe();
+            gBodyYaw += gTestTurn[i].yaw;
+            unlockSwipe();
+        }
+    }
+    if (freeAt >= 0) {
+        if (gTestLadder >= 0 && (long) frame == freeAt + gTestLadder && pPL && pG && pG->Rno0 == 3) {
+            Vec at = pPL->pos;
+            re4_log("turn: test ladder at frame %u (RE4_TEST_LADDER, level %d, routine %u/%u)", frame,
+                    gTestLadderLevel, (unsigned) pPL->r_no_0, (unsigned) pPL->r_no_1);
+            PlSetLadder(&at, pPL->ang.y, gTestLadderLevel);
+        }
+    }
+    // the swipe since the last frame: taken whether it turns or not (a swipe while not aiming is gone); Leon's turn too
+    lockSwipe();
+    const float swipeYaw = gSwipeYaw, swipePitch = gSwipePitch, bodyYaw = gBodyYaw;
+    gSwipeYaw = gSwipePitch = gBodyYaw = 0.0f;
+    unlockSwipe();
+    gBodyTurned = false;
+    if (bodyYaw != 0.0f) {
+        const float before = pPL ? (float) pPL->ang.y : 0.0f;
+        const char* why = turnBody(bodyYaw);
+        gBodyTurned = !why;
+        if (gTraceTurn && gTurnLines < 4000) {
+            gTurnLines++;
+            re4_log("turn: frame %u pl %u/%u/%u ang %.4f -> %.4f %s", frame, pPL ? (unsigned) pPL->r_no_0 : 0u,
+                    pPL ? (unsigned) pPL->r_no_1 : 0u, pPL ? (unsigned) pPL->r_no_2 : 0u, (double) before,
+                    pPL ? (double) pPL->ang.y : 0.0, why ? why : "turned");
+        }
+        if (!why && gBodyFrames++ % 900 == 0) {
+            re4_log("turn: Leon turned by the mouse or the look area (%u frames so far)", gBodyFrames);
+        }
+    }
+    // in the binoculars the swipe (the mouse) looks around (0.99.12, runtime/wheel_zoom.cpp)
+    if ((swipeYaw != 0.0f || swipePitch != 0.0f) && !re4_binocular_look(swipeYaw, swipePitch)) {
+        const bool harpoon = pPL && pPL->r_no_1 == 0xF;
+        const bool knife = pPL && pPL->r_no_0 == 0 && pPL->r_no_1 == 0xB;
+        if (turnAim(swipeYaw, swipePitch, true) && (knife ? gSwipedKnife++ : gSwiped++) % 900 == 0) {
+            re4_log("touch: the %s turned by a swipe (%u frames so far)",
+                    harpoon ? "harpoon's sight" : knife ? "knife's aim" : "aim", knife ? gSwipedKnife : gSwiped);
+        }
+    }
     const float yaw = value(__atomic_load_n(&gYawBits, __ATOMIC_RELAXED));
     const float pitch = value(__atomic_load_n(&gPitchBits, __ATOMIC_RELAXED));
     if (yaw == 0.0f && pitch == 0.0f) {
@@ -83,45 +324,115 @@ void gyroHook(unsigned)
     if (nowMs() - __atomic_load_n(&gWhen, __ATOMIC_RELAXED) > 150) {
         return;
     }
-    cPlayer* pl = pPL;
-    if (!pG || !pl || !pl->Wep || pG->Rno0 != 3 || StaFlagChk(pG, STA_SUB_SCRN) || StaFlagChk(pG, STA_EVENT)) {
-        return;
-    }
-    if (pl->r_no_0 != 0 || pl->r_no_1 != 6 || PlGetWeaponNo() == 0x10) {
-        return;
-    }
-    if (StaFlagChk(pG, STA_SCOPE_CAMERA) && CamCtrl.r0 == 0x10 && CamCtrl.m_pProc) {
-        CameraScope* scope = (CameraScope*) CamCtrl.m_pProc;
-        f32 zoom = 0.0f, angle = 0.0f;
-        scope->getParam(&zoom, &angle);
-        const float gain = kGain * kFrame * (1.0f - 0.9f * zoom);
-        pl->ang.y += yaw * gain;
-        float x = scope->angle_x - pitch * gain;
-        if (x < scope->angle_min) x = scope->angle_min;
-        if (x > scope->angle_max) x = scope->angle_max;
-        scope->angle_x = x;
-    } else if (pl->r_no_2 == 1 || pl->r_no_2 == 2) {
-        pl->ang.y += yaw * kGain * kFrame;
-        const f32 before = m3r;
-        m3r += pitch * kGain * kFrame / (kPi / 4.0f);
-        m3r.limit(-1.0f, 1.0f);
-        pl->Wep->pitch += ((f32) m3r - before) * (kPi / 2.0f);
-        pl->Wep->m_LockTime = 0;
-    } else {
-        return;
-    }
-    if (gTurned++ % 900 == 0) {
-        re4_log("gyro: the aim turned by the gyroscope (%u frames so far)", gTurned);
+    const bool harpoon = pPL && pPL->r_no_1 == 0xF;
+    if (turnAim(yaw * kGain * kFrame, pitch * kGain * kFrame, false) && gTurned++ % 900 == 0) {
+        re4_log(harpoon ? "gyro: the harpoon's sight moved by the gyroscope (%u frames so far)"
+                        : "gyro: the aim turned by the gyroscope (%u frames so far)",
+                gTurned);
     }
 }
 
+struct TestGyro {
+    TestGyro()
+    {
+        float yaw = 0.0f, pitch = 0.0f;
+        const char* v = getenv("RE4_TEST_GYRO");
+        if (v && sscanf(v, "%f,%f", &yaw, &pitch) == 2) {
+            gTest = true;
+            gYawBits = bits(yaw);
+            gPitchBits = bits(pitch);
+            gHooked = true;
+            re4_add_frame_hook(gyroHook);
+            re4_log("gyro: test turn rates %.3f, %.3f rad/s (RE4_TEST_GYRO)", (double) yaw, (double) pitch);
+        }
+        const char* sw = getenv("RE4_TEST_SWIPE");
+        if (sw && sscanf(sw, "%f,%f,%u,%u", &gTestSwipe[0], &gTestSwipe[1], &gTestSwipeFrom, &gTestSwipeTo) == 4) {
+            gHooked = true;
+            re4_add_frame_hook(gyroHook);
+            re4_log("touch: test swipe %.3f, %.3f radians a frame, frames %u .. %u (RE4_TEST_SWIPE)",
+                    (double) gTestSwipe[0], (double) gTestSwipe[1], gTestSwipeFrom, gTestSwipeTo);
+        } else {
+            gTestSwipeFrom = 1;
+            gTestSwipeTo = 0;
+        }
+        const char* tr = getenv("RE4_TRACE_AIM");
+        if (tr && *tr && *tr != '0') {
+            gTraceAim = true;
+            gHooked = true;
+            re4_add_frame_hook(gyroHook);
+        }
+        const char* turn = getenv("RE4_TEST_TURN");
+        for (const char* s = turn; s && *s && gTestTurns < 8;) {
+            TestTurn& tt = gTestTurn[gTestTurns];
+            tt.absolute = *s == 'a';
+            if (sscanf(tt.absolute ? s + 1 : s, "%f,%ld,%ld", &tt.yaw, &tt.from, &tt.to) != 3) {
+                break;
+            }
+            re4_log("turn: test %.4f radians a frame, frames %ld .. %ld %s (RE4_TEST_TURN)", (double) tt.yaw, tt.from,
+                    tt.to, tt.absolute ? "of the PADRead count" : "after the player is free");
+            gTestTurns++;
+            s = strchr(s, ';');
+            if (s) {
+                s++;
+            }
+        }
+        const char* ladder = getenv("RE4_TEST_LADDER");
+        if (ladder) {
+            sscanf(ladder, "%ld,%d", &gTestLadder, &gTestLadderLevel);
+        }
+        const char* tt = getenv("RE4_TRACE_TURN");
+        gTraceTurn = tt && *tt && *tt != '0';
+        if (gTestTurns || gTestLadder >= 0 || gTraceTurn) {
+            gHooked = true;
+            re4_add_frame_hook(gyroHook);
+        }
+    }
+} gTestGyro;
+
 } // namespace
+
+// The app (CoreBridge.aimTurn): a swipe of the touch area while aiming, in radians (yaw positive
+// left, pitch positive up), added up to the next game frame. Any thread.
+extern "C" void re4_core_aim_turn(float yaw, float pitch)
+{
+    if (!(yaw == yaw) || !(pitch == pitch)) {
+        return;
+    }
+    if (!__atomic_exchange_n(&gHooked, true, __ATOMIC_ACQ_REL)) {
+        re4_add_frame_hook(gyroHook);
+    }
+    lockSwipe();
+    gSwipeYaw += yaw;
+    gSwipePitch += pitch;
+    unlockSwipe();
+}
+
+// The app (CoreBridge.bodyTurn, 1.0): the mouse's or the look zone's movement sideways with the option "Turn Leon with
+// mouse / look area", in radians (positive left), added up to the next game frame, where it turns Leon if his own
+// movement allows it (turnBody). Any thread.
+extern "C" void re4_core_body_turn(float yaw)
+{
+    if (!(yaw == yaw)) {
+        return;
+    }
+    if (!__atomic_exchange_n(&gHooked, true, __ATOMIC_ACQ_REL)) {
+        re4_add_frame_hook(gyroHook);
+    }
+    lockSwipe();
+    gBodyYaw += yaw;
+    unlockSwipe();
+}
+
+// Patch 0234 (cPlayer::move): this game frame's turn turned Leon, so his camera follows him as when he walks.
+extern "C" int re4_body_turned(void)
+{
+    return gBodyTurned ? 1 : 0;
+}
 
 // The app (CoreBridge.gyro): the device's turn rates, any thread; 0, 0: still.
 extern "C" void re4_core_gyro(float yaw, float pitch)
 {
-    if (!gHooked) {
-        gHooked = true;
+    if (!__atomic_exchange_n(&gHooked, true, __ATOMIC_ACQ_REL)) {
         re4_add_frame_hook(gyroHook);
         re4_log("gyro: aiming by the gyroscope while a gun is aimed");
     }

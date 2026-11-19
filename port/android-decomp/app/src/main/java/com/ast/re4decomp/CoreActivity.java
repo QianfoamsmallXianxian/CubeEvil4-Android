@@ -7,8 +7,11 @@ import android.content.ClipData;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.Typeface;
+import android.hardware.display.DisplayManager;
 import android.hardware.input.InputManager;
 import android.media.AudioAttributes;
 import android.media.AudioManager;
@@ -17,12 +20,15 @@ import android.opengl.GLSurfaceView;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.Looper;
+import android.os.Process;
 import android.os.SystemClock;
 import android.os.VibrationAttributes;
 import android.os.VibrationEffect;
 import android.os.Vibrator;
 import android.os.VibratorManager;
+import android.os.CombinedVibration;
 import android.provider.DocumentsContract;
 import android.util.Log;
 import android.view.Choreographer;
@@ -33,11 +39,16 @@ import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.SurfaceHolder;
+import android.view.SurfaceView;
 import android.view.View;
+import android.view.ViewGroup;
+import android.view.ViewConfiguration;
+import android.view.WindowInsets;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
 import android.widget.TextView;
 import android.widget.Toast;
+import com.ast.re4decomp.disc.RoomFileCheck;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -86,11 +97,73 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
   static final String GYRO_AIM = "gyroAiming";
   // the menu's switch "Alternate Controls" (CoreInput.setAlternate)
   static final String ALT_CONTROLS = "alternateControls";
-  // the menu's switch "Latch L and R" of the touch controls (CoreTouch.setLatch; off: held while touched)
+  // the menu's "Button Mapping" (ActionMap.encode; absent: the default), the controller's and the
+  // keyboard's; "bindings", "extraKeys" (27.10.2026) and "keyMap" (the free keys until 29.10.2026) held
+  // the versions before, dropped
+  static final String BINDINGS_CONTROLLER = "mappingController", BINDINGS_KEYBOARD = "mappingKeyboard";
+  static final String OLD_KEY_MAP = "keyMap";
+  // the mouse's sensitivity (the button mapping's slider, 0.25 .. 3, 1 = as below)
+  static final String MOUSE_SENSITIVITY = "mouseSensitivity";
+  static final float MOUSE_MIN = 0.25f, MOUSE_MAX = 3f, MOUSE_STEP = 0.25f;
+  /** The aim's turn per count of the captured mouse at sensitivity 1 (about 400 counts a radian). */
+  static final float MOUSE_AIM_RADIANS = 0.0025f;
+  /** The camera's C stick per count of the captured mouse in one event at sensitivity 1. */
+  static final float MOUSE_LOOK = 0.05f;
+  // the menu's comfort control "Latch L and R" (CoreTouch.setLatch, CoreInput.setLatch; off: held
+  // while touched or pressed); the touch controls' only until 23.10.2026, the name stays
   static final String TOUCH_LATCH = "touchLatchLR";
-  /** The menu's picture options: scale (0 auto, 1-4), samples, anisotropy, aspect (0 16:9, 1 4:3). */
+  // the menu's comfort control "Latch B" (the same; on: Leon keeps running)
+  static final String TOUCH_LATCH_B = "touchLatchB";
+  static final String TOUCH_AIM = "touchAim";
+  // the laser sight's colour (CoreMenu, CONTROLS, LASER SIGHT; wish of the project owner, 04.11.2026): 0 the game's red
+  static final String LASER_COLOUR = "laserColour";
+  // the menu's slider of gyro aiming (GyroAim.setSensitivity, a float, 1 = as before)
+  static final String GYRO_SENSITIVITY = "gyroSensitivity";
+  // the menu's switches "Invert vertical" / "Invert horizontal" of gyro aiming (GyroAim.setInvert; off)
+  static final String GYRO_INVERT_V = "gyroInvertVertical", GYRO_INVERT_H = "gyroInvertHorizontal";
+  // the menu's switch "Knife by Swipe" (watchTap: a swipe while playing draws the knife and slashes; on)
+  static final String KNIFE_SWIPE = "knifeSwipe";
+  // the menu's "Invert vertical" and "Aim speed" of aiming by touch and controllers, not the gyro (wish of the
+  // project owner, 30.10.2026; CoreBridge.setAim: the game's own "reverse" option and the stick's turn while
+  // aiming, the touch area's swipes too; off, 1 = as the game)
+  static final String AIM_INVERT_V = "aimInvertVertical", AIM_SPEED = "aimSpeed";
+  // the menu's "Stick dead zone" and "Stick range" of the controller sticks in percent (wish of the project owner,
+  // 07.11.2026, GitHub issue #168; CoreInput.setStickShape: 0 and 100, the defaults, leave the sticks as they are)
+  // and "Vibration" (RumbleTarget: 0 Auto, 1 Device, 2 Controller, 3 Off)
+  static final String STICK_DEAD_ZONE = "stickDeadZone", STICK_RANGE = "stickRange", VIBRATION = "vibration";
+  // the menu's "Auto aim" (the game's own lock-on) and "Always run" (the run key walks instead; wish of the
+  // project owner, 30.10.2026; CoreBridge.setAim, runtime/aim_options.cpp; both off)
+  static final String AUTO_AIM = "autoAim", ALWAYS_RUN = "alwaysRun", FAR_CAMERA = "farCamera";
+  /** "Gentler QTEs" (0.99.15): Professional's quick-time events as Normal's; on by default. */
+  static final String GENTLE_QTE = "gentleQte";
+  /** "Turn Leon with mouse / look area" (1.0): the movement sideways turns Leon himself (CoreInput.setBodyTurn); off. */
+  static final String BODY_TURN = "bodyTurn";
+  static final boolean GENTLE_QTE_DEFAULT = true;
+  static final float AIM_SPEED_MIN = 0.5f, AIM_SPEED_MAX = 3f, AIM_SPEED_STEP = 0.25f;
+  // the menu's "Field of view" (PLAYER VIEW; wish of the project owner, 05.11.2026): degrees added to the shoulder
+  // camera's vertical field of view, -FOV_RANGE .. FOV_RANGE, 0 as the game (CoreBridge.setFov, patch 0205)
+  static final String FOV_OFFSET = "fovOffset";
+  static final int FOV_RANGE = 15;
+  static int fovOffset(SharedPreferences input) {
+    return Math.max(-FOV_RANGE, Math.min(FOV_RANGE, input.getInt(FOV_OFFSET, 0)));
+  }
+  /** The menu's picture options: scale (0 auto, 1-4), samples, anisotropy, aspect (0 16:9, 1 4:3, 2 stretched, 3 4:3 without bars, 5 Native). */
   static final String GRAPHICS_PREFS = "core_graphics";
-  private static final int REQUEST_EXPORT_ALL = 2, REQUEST_IMPORT = 3, REQUEST_REPORT = 4;
+  /** The menu's "Game language" with the European discs (0 the device's, 2..6 as CoreBridge.setLanguage). */
+  static final String GAME_PREFS = "core_game", GAME_LANGUAGE = "gameLanguage";
+  /** The cheat menu's switches (CoreBridge.setCheats: 1 health, 2 ammo, 4 one-hit kill, 8 automatic QTEs, 16 the
+   *  extra games kept unlocked, the story's player character << 5 (2 Ada, 3 HUNK, 4 Krauser, 5 Wesker), 256 the
+   *  special costume; off). */
+  static final String CHEATS = "cheats";
+  /** The cheat "Costumes · Leon's jacket" (1.0, GAME_PREFS; CoreBridge.setLeonJacket): Leon keeps his brown jacket. */
+  static final String LEON_JACKET = "leonJacket";
+  /** The cheat "Random enemies" (0.99.12): its seed, 0 off (CoreBridge.setEnemyRandom). */
+  static final String ENEMY_SEED = "enemySeed";
+  private static final int REQUEST_EXPORT_ALL = 2, REQUEST_IMPORT = 3, REQUEST_REPORT = 4, REQUEST_TEXTURES = 5,
+      REQUEST_EXPORT_ZIP = 6;
+  // "Import texture pack" (Cheats & Mods, TexturePacks): who hears the import, its cancel switch
+  private TexturePacks.Listener textureListener;
+  private final java.util.concurrent.atomic.AtomicBoolean textureCancel = new java.util.concurrent.atomic.AtomicBoolean();
   /** SELECT held this long: the game's debug menu. */
   private static final long SELECT_HOLD_MS = 1000;
 
@@ -99,7 +172,31 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
   private final CoreInput input = new CoreInput();
   private final CoreAudio audio = new CoreAudio(this);
   private final Set<Integer> seenDevices = new HashSet<>();
-  private GLSurfaceView surface;
+  private final ControllerLog controllerLog = new ControllerLog();
+  /** How long a controller's input took from Android to the app (InputDelay), for the error log. */
+  private final InputDelay inputDelay = new InputDelay();
+  // the main stick as the game reads it for walking, a line every 30 s of use (StickWatch; report of 07.11.2026)
+  private final StickWatch stickWatch = new StickWatch();
+  // the view the picture is drawn into: GameSurface.Gl (OpenGL ES) or VulkanSurface (Vulkan, vulkan-bauplan.md E6);
+  // picture is the same view's render calls (volatile: the beat's thread asks for pictures)
+  private SurfaceView surface;
+  private volatile GameSurface picture;
+  private int renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY;
+  // Vulkan from Android 10 (API 29) on and with Vulkan 1.1 (the plan's minimum; vulkan-bauplan.md)
+  static final int VULKAN_MIN_SDK = 29;
+  private static final int VULKAN_1_1 = (1 << 22) | (1 << 12);
+  private boolean vulkan;
+  // the menu's renderer (GRAPHICS_PREFS): "gles" (the default) or "vulkan"; the crash guard (VulkanGuard): its mark set
+  // at the first Vulkan start of a process, cleared once Vulkan has drawn for a few seconds (vulkanGuard), when the
+  // game ends normally or goes to the background; still set at the next start: OpenGL ES then if that process crashed
+  // (vulkan-bauplan.md E7; since 0.99.6 by how it ended)
+  static final String RENDERER = "renderer", VULKAN_STARTING = VulkanGuard.STARTING;
+  private static boolean vulkanMarked;  // this process set the mark (once: not again for a new activity)
+  private static final long VULKAN_GUARD_MS = 2000;
+  private static final long VULKAN_GUARD_PICTURES = 120;
+  private int vulkanGuardChecks;
+  // the renderer of this run for the report's renderer.txt (and why it is not Vulkan when Vulkan was asked for)
+  private String rendererLine = "OpenGL ES";
   // the touch controls (RetroTouch) and its editor, during which the game stands
   private TouchControls touchControls;
   private GyroAim gyroAim;
@@ -107,53 +204,151 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
   private String startProblem = "";
   private String settings = "";
   private volatile boolean destroyed;
+  // the language at the start or the last change (onConfigurationChanged)
+  private String shownLanguage = "";
+  private boolean retailEu;  // the European discs are imported: the menu offers the game's language
+  private boolean retail;  // any retail discs (European, US, Japanese, Korean): no debug menu (retail-us-plan.md, retail-jp-plan.md)
+  private int gameLanguageNow;  // the language the game runs with (European discs)
   // the menu (SELECT) and the debug menu (SELECT held)
   private CoreMenu menu;
   private boolean menuSupported, tools, selectDown, selectHeld;
   private final List<byte[]> pendingImports = new ArrayList<>();
-  private boolean resumed;
+  // Android's thermal status and headroom for the error log and the report (0.99.15, ThermalWatch)
+  private ThermalWatch thermal;
+  // the touch layout file the chosen files hold (TouchLayoutFile), after the .gci files
+  private byte[] pendingTouch;
+  // the parts of the app's own ZIP (PlayerBackup, 0.99.15) after the touch layout: the instant save, the settings file
+  // with the ZIP's manifest (where it was made); whether the import put settings in place (then a restart is offered)
+  private byte[] pendingInstant, pendingSettings, pendingManifest;
+  private boolean importedSettings;
+  // (read by the picture's beat on its own thread too)
+  private volatile boolean resumed;
   // GPU step c: the picture drawn at each vsync or, on a faster screen, at every n-th
   private final FramePacing pacing = new FramePacing();
-  private int vsyncs;
   private boolean paceLogged;
+  // the beat's own thread (0.98.5): its Choreographer, not the UI thread's (vsyncTick)
+  private HandlerThread beatThread;
+  private Handler beat;
+  // the UI thread's vsyncs, only counted for the log (uiTick): late callbacks, the touch controls shown
+  private final FramePacing uiBeat = new FramePacing();
+  private long uiLogAt = Long.MIN_VALUE;
+  private int uiShownVsyncs;
   // the screen was asked for 60 Hz (preferSixtyHz): the surface too, once it exists
   private boolean askSixty;
-  // rumble: the game's motor (CoreBridge.rumble) on the device's vibrator
+  // rumble: the game's motor (CoreBridge.rumble) on the device's vibrator or, since 0.99.2, a controller's motors
+  // (the menu's "Vibration", RumbleTarget; chooseRumble)
   private Vibrator vibrator;
+  private int rumbleMode, rumbleTarget, lastPad = -1;
+  private VibratorManager padMotors;  // the controller's motors while they are the target (Android 12 and later)
+  private boolean padAmplitude;
+  private String rumbleLine = "";
+  /**
+   * Each start of the motor by its level 1..4 (the game's motor in the last four frames): 190 up to
+   * 310 ms (120 until 27.10.2026, then 170: a shotgun still felt like a slingshot, device test).
+   */
+  static int rumblePulseMs(int level) { return 150 + 40 * Math.max(1, Math.min(4, level)); }
   private boolean amplitudeControl, vibrating;
   private int rumbleFrames = -1, rumbleLevel;
   private long rumbleSeen, rumbleUntil;
   private volatile int preparedRoom = -1;
   private boolean roomBusy;
-  // the FPS display (menu switch): the game's frames per second and the screen's rate, bottom left
-  // ("30 FPS (Game) · 60 Hz": the game makes 30 pictures a second, as on the GameCube; a phone's
-  // own counter shows the screen's rate, which is not the game's)
+  // the Information HUD (menu switch, InfoHud; until 0.99.10 the FPS display): the game's frames per second and the
+  // screen's rate ("30 FPS (Game) · 60 Hz": the game makes 30 pictures a second, as on the GameCube; a phone's
+  // own counter shows the screen's rate, which is not the game's), the resolution, the game's play time
   private TextView fpsView;
-  private long fpsFrames = -1, fpsSince;
+  private String hudFps = "";  // the last second's FPS part (InfoHud), "-- FPS (Game)" until counted
+  // where it is (the menu's button, wish of the project owner, 05.11.2026: it covered the minimap): 0 off, 1 bottom
+  // left, 2 bottom centre, 3 top left, 4 top centre; before 05.11.2026 the switch "fps" alone (on: bottom left)
+  static final String FPS_PLACE = "fpsPlace";
+  static final int FPS_PLACES = 5;
+  private int fpsPlace;
+  private WindowInsets fpsInsets;
+  // the camera cutout's last line in the error log (cutoutInsets)
+  private String cutoutLine = "";
+  // the touch controls' B at the last touch event (benchTouch: a press ends the benchmark)
+  private boolean touchBenchB;
+  private long fpsFrames = -1, fpsPictures, fpsSince;
   // a game that stands without a pause (a hang): reported once per stand
   private long lastFrames = -1, framesSince;
   private boolean hangReported;
   private static final long HANG_MS = 8000;
   // the core in a process of its own ended (CoreBridge.coreProblem): shown once
   private boolean coreEndShown;
+  // a disc file the game could not read (CoreBridge.discProblem): checked and shown once; the
+  // check's line goes into the error report (disc-check.txt)
+  private boolean discProblemSeen;
+  private volatile String discCheck = "";
 
   @Override
   @SuppressLint("ClickableViewAccessibility")
   public void onCreate(Bundle state) {
     super.onCreate(state);
+    // an unofficial build's warning not confirmed in this process (OfficialBuild; Android brought the game back in a
+    // new process, past the start screen): the start screen first, which warns and then starts the game itself
+    if (OfficialBuild.mustWarn(this)) {
+      startActivity(new Intent(this, MainActivity.class).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP));
+      finish();
+      return;
+    }
     getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+    // no force dark over the game, its touch controls and displays (FocusLook, 0.99.11)
+    FocusLook.noForceDark(getWindow());
     hideSystemUi();
+    // the game's window over the camera's cutout too (0.99.17, as first in 0.99.15; a user's Moto G22: a black strip on
+    // the camera's side); the touch controls cover all of it, their layouts keep their spots (Cutout, TouchFrame)
+    Cutout.extend(getWindow());
     ImportManager imports = ((Re4Application) getApplication()).imports;
     // test switches of the core (port/scripts/test-core-app.ps1 passes them)
     settings = getIntent().getStringExtra("coreSettings");
     if (settings == null) settings = "";
     // the error log of this run (the one before is kept for the report)
     CoreLog.start(this, settings);
-    // linked shader programs kept between runs (no compile stutter the second time)
-    String programs = "RE4_GX_PROGRAM_CACHE=" + new File(getCacheDir(), "gx-programs").getAbsolutePath();
+    // how hot the device is: at the start, at each change, the headroom every 10 s (ThermalWatch; only told)
+    thermal = ThermalWatch.forDevice(this, SystemClock.elapsedRealtime());
+    thermal.start(SystemClock.elapsedRealtime());
+    // on to the renderer: Dynamic's step lines name the heat
+    thermal.setListener((status, headroom) -> {
+      try {
+        CoreBridge.setThermal(status, headroom);
+      } catch (UnsatisfiedLinkError e) {
+        thermal.setListener(null);
+      }
+    });
+    shownLanguage = language();
+    Log.i(TAG, "app menu: " + shownLanguage);
+    // the shaders the renderers built, kept between runs (no compile stutter the second time); since 0.99.4 where
+    // Android and cleaner apps do not empty them, the old cache folder moved over once (ShaderCache)
+    Log.i(TAG, "shader cache: " + ShaderCache.prepare(this));
+    String programs = "RE4_GX_PROGRAM_CACHE=" + ShaderCache.dir(this).getAbsolutePath();
+    // the app's list of shader programs (port/tools/gx_program_list.py): made ahead from the first start
+    String programList = assetFile("gx-programs.keys");
+    if (programList != null) programs += ";RE4_GX_PROGRAM_LIST=" + programList;
+    // Vulkan's pipelines of all rooms (port/tools/gx_vkpipe_list.py, 0.99.5): made ahead on a thread of the renderer
+    String pipeList = assetFile("gx-vkpipes.keys");
+    if (pipeList != null) programs += ";RE4_GX_VK_PIPE_LIST=" + pipeList;
     String coreSettings = settings.isEmpty() ? programs : settings + ";" + programs;
-    // the app's own folder on the shared storage, where test switches write (RE4_AUDIO_WAV)
-    getExternalFilesDir(null);
+    // how the game's last process ended (Android 11 on; the crash guard below, the reports)
+    VulkanGuard.Exit lastEnd = VulkanGuard.lastExit(this, 0);
+    if (lastEnd != null) Log.i(TAG, "the game's last process ended: " + lastEnd);
+    // the renderer: Vulkan (the test switch RE4_GX_API=vulkan) or OpenGL ES; the core hears it as RE4_GX_API
+    vulkan = chooseVulkan();
+    coreSettings = withRenderer(coreSettings, vulkan);
+    // the game's language with the European discs (retail-eu-plan.md R7; a test script's setting wins)
+    String release = imports.root == null ? null
+        : com.ast.re4decomp.disc.DiscInstaller.release(new File(imports.root, "disc1"));
+    retailEu = com.ast.re4decomp.disc.GameCubeDisc.EUROPEAN.equals(release);
+    retail = release != null && !com.ast.re4decomp.disc.GameCubeDisc.DEBUG.equals(release);
+    gameLanguageNow = gameLanguage(this);
+    if (retailEu && !settings.contains("RE4_GAME_LANGUAGE=")) {
+      coreSettings += ";RE4_GAME_LANGUAGE=" + gameLanguageNow;
+      Log.i(TAG, "game language: " + gameLanguageNow);
+    }
+    // the app's own folder (on the shared storage, else internal), where test switches write (RE4_AUDIO_WAV)
+    AppStorage.base(this);
+    // Management -> "Delete All Data" (0.99.15, PlayerWipe): the memory card and the instant save go before the core
+    // opens them; the core then makes a new, formatted card
+    String wiped = PlayerWipe.prepare(this, imports.root);
+    if (!wiped.isEmpty()) Log.i(TAG, wiped);
     applyGraphics();
     startProblem = imports.root == null ? "No data folder"
         : CoreBridge.start(imports.root.getAbsolutePath(), coreSettings);
@@ -161,52 +356,177 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
     SharedPreferences inputPrefs = getSharedPreferences(INPUT_PREFS, MODE_PRIVATE);
     input.setSwapFace(inputPrefs.getBoolean(SWAP_FACE, false));
     input.setAlternate(inputPrefs.getBoolean(ALT_CONTROLS, false));
+    if (inputPrefs.contains(OLD_KEY_MAP)) {
+      Log.i(TAG, "layout: the free keys of the controller configuration (" + inputPrefs.getString(OLD_KEY_MAP, "")
+          + ") dropped; the button mapping starts from the default");
+      inputPrefs.edit().remove(OLD_KEY_MAP).apply();
+    }
+    input.setControllerMap(ActionMap.decode(ActionMap.KIND_CONTROLLER, inputPrefs.getString(BINDINGS_CONTROLLER, null)));
+    input.setKeyboardMap(ActionMap.decode(ActionMap.KIND_KEYBOARD, inputPrefs.getString(BINDINGS_KEYBOARD, null)));
+    if (inputPrefs.contains("bindings") || inputPrefs.contains("extraKeys")) {
+      inputPrefs.edit().remove("bindings").remove("extraKeys").apply();
+    }
+    input.setLatch(inputPrefs.getBoolean(TOUCH_LATCH, false), inputPrefs.getBoolean(TOUCH_LATCH_B, false));
+    input.setTouchAim(inputPrefs.getInt(TOUCH_AIM, CoreInput.AIM_MOVE_STICK));
+    knifeSwipe = inputPrefs.getBoolean(KNIFE_SWIPE, true);
     // R3 saves graphics data with the test scripts (RE4_APP_TOOLS=1) or when the menu switched it on
     tools = settings.contains("RE4_APP_TOOLS=1") || inputPrefs.getBoolean(R3_CAPTURE, false);
     logLayout();
+    rumbleMode = RumbleTarget.clampMode(inputPrefs.getInt(VIBRATION, RumbleTarget.AUTO));
     setUpVibrator();
     // the volume buttons set the game's volume
     setVolumeControlStream(AudioManager.STREAM_MUSIC);
 
     FrameLayout root = new FrameLayout(this);
-    surface = new GLSurfaceView(this);
-    surface.setEGLContextClientVersion(3);
-    surface.setPreserveEGLContextOnPause(true);
-    surface.setRenderer(new GLSurfaceView.Renderer() {
-      @Override public void onSurfaceCreated(GL10 gl, EGLConfig config) { CoreBridge.surfaceCreated(); }
-      @Override public void onSurfaceChanged(GL10 gl, int w, int h) { CoreBridge.resize(w, h); }
-      @Override public void onDrawFrame(GL10 gl) { CoreBridge.draw(); }
-    });
+    if (vulkan) {
+      VulkanSurface v = new VulkanSurface(this, this::vulkanFailed);
+      surface = v;
+      picture = v;
+      main.postDelayed(vulkanGuard, VULKAN_GUARD_MS);
+    } else {
+      surface = glSurface();
+    }
     root.addView(surface);
-    surface.getHolder().addCallback(new SurfaceHolder.Callback() {
-      @Override public void surfaceCreated(SurfaceHolder holder) { surfaceSixtyHz(holder.getSurface()); }
-      @Override public void surfaceChanged(SurfaceHolder holder, int format, int w, int h) {}
-      @Override public void surfaceDestroyed(SurfaceHolder holder) {}
-    });
-    // the surface takes the fingers beside the touch controls: Android gives the further fingers
-    // of a touch only to views that took one, so a thumb beside the buttons would block them
-    surface.setOnTouchListener((v, e) -> true);
+    surfaceCallbacks(surface);
+    // the benchmark's line at the top while it runs (Display -> GRAPHICS -> Benchmark)
+    benchView = new TextView(this);
+    benchView.setTextSize(14);
+    benchView.setTextColor(Color.WHITE);
+    benchView.setBackgroundColor(0xA0000000);
+    benchView.setPadding(24, 10, 24, 10);
+    benchView.setGravity(Gravity.CENTER);
+    benchView.setVisibility(View.GONE);
+    root.addView(benchView, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT,
+        FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.CENTER_HORIZONTAL));
     fpsView = new TextView(this);
     fpsView.setTypeface(Typeface.MONOSPACE);
     fpsView.setTextSize(11);
     fpsView.setTextColor(Color.WHITE);
     fpsView.setBackgroundColor(0x60000000);
     fpsView.setPadding(8, 2, 8, 2);
+    // bottom left and left to right in every language, Arabic too (the menu's switch says so)
+    fpsView.setTextDirection(View.TEXT_DIRECTION_LTR);
     root.addView(fpsView, new FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT,
-        FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.START));
-    showFps(getSharedPreferences(GRAPHICS_PREFS, MODE_PRIVATE).getBoolean("fps", false));
+        FrameLayout.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.LEFT));
+    // kept clear of the screen's rounded corner, a cutout and bars that stay (CornerInset; tester report
+    // 05.11.2026: the corner cut the text off); asked again when the window turns or the bars come and go
+    fpsView.setOnApplyWindowInsetsListener((v, insets) -> {
+      fpsInsets = insets;
+      placeFps();
+      return insets;
+    });
+    showFps(fpsPlace(getSharedPreferences(GRAPHICS_PREFS, MODE_PRIVATE)));
     // the touch controls above everything
     touchControls = new TouchControls(this, input, touchMode(inputPrefs), touchHost);
     touchControls.setLatch(inputPrefs.getBoolean(TOUCH_LATCH, false));
+    touchControls.setLatchB(inputPrefs.getBoolean(TOUCH_LATCH_B, false));
     gyroAim = new GyroAim(this, main);
+    gyroAim.setSensitivity(inputPrefs.getFloat(GYRO_SENSITIVITY, 1f));
+    mouseSensitivity = clampMouse(inputPrefs.getFloat(MOUSE_SENSITIVITY, 1f));
+    aimInvert = inputPrefs.getBoolean(AIM_INVERT_V, false);
+    autoAim = inputPrefs.getBoolean(AUTO_AIM, false);
+    alwaysRun = inputPrefs.getBoolean(ALWAYS_RUN, false);
+    input.setBodyTurn(inputPrefs.getBoolean(BODY_TURN, false));
+    if (input.bodyTurn()) Log.i(TAG, "turn Leon with mouse / look area: on");
+    // "modernMove": a switch of a 0.99.7 test build, taken out again (decision of the project owner, 10.11.2026)
+    if (inputPrefs.contains("modernMove")) inputPrefs.edit().remove("modernMove").apply();
+    aimSpeed = clampAimSpeed(inputPrefs.getFloat(AIM_SPEED, 1f));
+    input.setStickShape(inputPrefs.getInt(STICK_DEAD_ZONE, 0), inputPrefs.getInt(STICK_RANGE, 100));
+    stickWatch.setShape(input.deadZone(), input.range());
+    if (input.deadZone() != 0 || input.range() != 100) {
+      Log.i(TAG, "sticks: dead zone " + input.deadZone() + " %, range " + input.range() + " %");
+    }
+    // the mouse (step 2 of the button mapping, 29.10.2026): captured while the game is in front, its
+    // buttons through the keyboard's mapping, its movement the camera and, while aiming, the aim
+    if (Build.VERSION.SDK_INT >= 26) {
+      surface.setFocusable(true);
+      surface.setFocusableInTouchMode(true);
+      surface.setOnCapturedPointerListener((v, e) -> {
+        capturedMouse(e);
+        return true;
+      });
+    }
+    gyroAim.setInvert(inputPrefs.getBoolean(GYRO_INVERT_V, false), inputPrefs.getBoolean(GYRO_INVERT_H, false));
     gyroAim.setEnabled(inputPrefs.getBoolean(GYRO_AIM, false));
     root.addView(touchControls.view(), new FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT,
         FrameLayout.LayoutParams.MATCH_PARENT));
-    if (startProblem.isEmpty()) CoreBridge.setDof(getSharedPreferences(GRAPHICS_PREFS, MODE_PRIVATE).getBoolean("dof", true));
+    // the camera's cutout (Cutout, 0.99.17): the touch controls cover the whole window, their layouts follow the
+    // camera's side; the error log says what the window got. Again when the screen turns by 180 degrees.
+    root.setOnApplyWindowInsetsListener((v, insets) -> {
+      // the touch layouts for the camera's side (TouchFrame); the log after the layout: the window's size and place are
+      // known then
+      touchControls.setSafeInsets(Cutout.safe(insets));
+      v.post(() -> cutoutInsets(v, insets));
+      return v.onApplyWindowInsets(insets);
+    });
+    benchFlow = new BenchmarkFlow(benchHost);
+    if (startProblem.isEmpty()) {
+      SharedPreferences g = getSharedPreferences(GRAPHICS_PREFS, MODE_PRIVATE);
+      perfFirstRun(g);
+      CoreBridge.setDof(CoreMenu.dofLevel(g));
+      // one or the other (CoreMenu): saved with both on before 26.10.2026, 60 FPS stays
+      // Frame skip one setting since 0.99.8 (CoreMenu.frameSkipMode: the two switches of before taken over, both on:
+      // Aggressive); with 60 FPS off (saved with both on before 26.10.2026: 60 FPS stays)
+      int skip = CoreMenu.frameSkipMode(g);
+      if (g.getBoolean("smooth60", false)) skip = 0;
+      if (!g.contains(CoreMenu.FRAME_SKIP) || g.getInt(CoreMenu.FRAME_SKIP, 0) != skip) CoreMenu.storeFrameSkipMode(g, skip);
+      CoreBridge.setSmooth(g.getBoolean("smooth60", false));
+      CoreBridge.setFrameSkip(skip == 1);
+      CoreBridge.setCpuSkip(skip == 2);
+      CoreBridge.setVkBandwidth(g.getBoolean("vkBandwidth", false));
+      CoreBridge.setFxaa(g.getBoolean("fxaa", false));
+      CoreBridge.setSharpen(CoreMenu.sharpenLevel(g));
+      CoreBridge.setSharperText(CoreMenu.sharperText(g));
+      CoreBridge.setCrt(CoreMenu.crtLevel(g));
+      CoreBridge.setBloom(CoreBridge.bloomSent(g));
+      CoreBridge.setColour(CoreMenu.colourMode(g), CoreMenu.colourLevel(g));
+      CoreBridge.setTvFilter(g.getBoolean("tvFilter", false));
+      CoreBridge.setPsx(g.getBoolean("psx", false));
+      TexturePacks.apply(this, g);
+      CoreBridge.setFlares(CoreBridge.flareMode(g));
+      CoreBridge.setViewDistance(CoreBridge.VIEW_PERCENT[CoreBridge.viewDistance(g)]);
+      CoreBridge.setMinimap(g.getBoolean("minimap", false));
+      CoreBridge.setLaserColour(getSharedPreferences(INPUT_PREFS, MODE_PRIVATE).getInt(LASER_COLOUR, 0));
+      CoreBridge.setMerge(g.getBoolean("mergeDraws", false));
+      CoreBridge.setFarCamera(getSharedPreferences(INPUT_PREFS, MODE_PRIVATE).getBoolean(FAR_CAMERA, false));
+      CoreBridge.setFov(fovOffset(getSharedPreferences(INPUT_PREFS, MODE_PRIVATE)));
+      CoreBridge.setVertexRing(g.getBoolean("vertexRing", false));
+      // "Dynamic" up to the benchmark's levels on this device, when it ran
+      CoreBridge.setDynamicCaps(g.getInt(CoreMenu.DYN_CAP_30, 0), g.getInt(CoreMenu.DYN_CAP_60, 0));
+      CoreBridge.setFastCores(g.getInt("fastCores", 0) == 1);
+      CoreBridge.setPotato(CoreBridge.potatoSent(g));
+      CoreBridge.sendSoundVolume(g);
+      CoreBridge.setAim(aimInvert, aimSpeed, autoAim, alwaysRun);
+      CoreBridge.setGentleQte(getSharedPreferences(INPUT_PREFS, MODE_PRIVATE).getBoolean(GENTLE_QTE, GENTLE_QTE_DEFAULT));
+      // the cheat switches kept from the last run (a test script's RE4_CHEATS wins)
+      int cheats = getSharedPreferences(GAME_PREFS, MODE_PRIVATE).getInt(CHEATS, 0);
+      if (!settings.contains("RE4_CHEATS=")) {
+        if (cheats != 0) Log.i(TAG, "cheats: " + cheats);
+        CoreBridge.setCheats(cheats);
+      }
+      // the cheat "Leon's jacket" (1.0; a test script's RE4_LEON_JACKET wins)
+      if (!settings.contains("RE4_LEON_JACKET=")) {
+        final boolean jacket = getSharedPreferences(GAME_PREFS, MODE_PRIVATE).getBoolean(LEON_JACKET, false);
+        if (jacket) Log.i(TAG, "cheats: Leon's jacket");
+        CoreBridge.setLeonJacket(jacket);
+      }
+      int enemySeed = getSharedPreferences(GAME_PREFS, MODE_PRIVATE).getInt(ENEMY_SEED, 0);
+      if (enemySeed != 0) Log.i(TAG, "cheats: random enemies with seed " + enemySeed);
+      CoreBridge.setEnemyRandom(enemySeed);
+    }
     setContentView(root);
+    // Android Automotive: the bars the car keeps stay off the picture (CarDisplay; nothing elsewhere)
+    CarDisplay.fit(this, getWindow());
     preferSixtyHz();
     surface.setFocusable(true);
     surface.requestFocus();
+    // sticks, triggers and the hat at once (Android 11 and later): Android otherwise holds a controller's
+    // motion back for the next refresh of the screen (up to 17 ms) and hands over a batch (controller lag report,
+    // 05.11.2026); buttons come at once anyway
+    if (Build.VERSION.SDK_INT >= 30) {
+      surface.requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK);
+      getWindow().getDecorView().requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK);
+    }
     if (Build.VERSION.SDK_INT >= 33)
       getOnBackInvokedDispatcher().registerOnBackInvokedCallback(0, this::askExit);
     if (!startProblem.isEmpty()) {
@@ -219,16 +539,16 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
   /** The core did not start: why, with the error report to send. */
   private void showStartProblem() {
     if (destroyed) return;
-    new AlertDialog.Builder(this)
+    Immersive.show(new AlertDialog.Builder(this)
         .setMessage(getString(R.string.ingame_core_not_started, startProblem))
         .setPositiveButton(R.string.ingame_send_report, (d, w) -> shareReport())
         .setNegativeButton(R.string.ingame_quit, (d, w) -> quit())
-        .setCancelable(false).show();
+        .setCancelable(false).create());
   }
 
   /**
-   * The core in a process of its own (32-bit devices whose Java heap lies where the game's memory
-   * must be): when that process ends (a crash), the app stays and says so, with the error report
+   * The core in a process of its own (devices whose Java heap lies where the game's memory must be:
+   * 32 bit with Android 14, some 64-bit ones since 31.10.2026): when that process ends (a crash), the app stays and says so, with the error report
    * to send (the crash is in it).
    */
   private void checkCoreProcess() {
@@ -239,18 +559,67 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
     Log.e(TAG, "core process: " + ended);
     audio.stop();
     stopVibrator();
-    new AlertDialog.Builder(this)
+    Immersive.show(new AlertDialog.Builder(this)
         .setMessage(getString(R.string.ingame_core_stopped, ended))
         .setPositiveButton(R.string.ingame_send_report, (d, w) -> shareReport())
         .setNegativeButton(R.string.ingame_quit, (d, w) -> quit())
-        .setCancelable(false).show();
+        .setCancelable(false).create());
+  }
+
+  /**
+   * A disc file the game could not read (the core gives up on it and the game stands, reports of
+   * 25./26.10.2026: St2/r222.das read as zeros): which file, whether the disc image or the copy on the
+   * device is at fault (RoomFileCheck.diagnose against the import's manifest and files.tsv), and what
+   * to do, once.
+   */
+  private void checkDiscProblem() {
+    if (discProblemSeen || !startProblem.isEmpty()) return;
+    String problem = CoreBridge.discProblem();
+    if (problem == null || problem.isEmpty()) return;
+    discProblemSeen = true;
+    String[] f = problem.split("\t", 3);
+    if (f.length < 3) return;
+    final int disc = f[0].equals("2") ? 2 : 1;
+    final String path = f[1], why = f[2];
+    Log.e(TAG, "disc file: disc " + disc + " " + path + ": " + why);
+    final ImportManager imports = ((Re4Application) getApplication()).imports;
+    rooms.execute(() -> {
+      File folder = new File(imports.root, "disc" + disc);
+      InputStream catalog = null;
+      try {
+        catalog = imports.roomCatalog(folder);
+      } catch (IOException ignored) { /* diagnosed without the catalog */
+      }
+      RoomFileCheck.Diagnosis d = RoomFileCheck.diagnose(folder, path, catalog, disc);
+      discCheck = "core: " + why + "\n" + d.cause + ": " + d.detail + "\n";
+      Log.e(TAG, "disc file check: " + d.cause + ": " + d.detail);
+      main.post(() -> showDiscProblem(d.cause, path, disc));
+    });
+  }
+
+  private void showDiscProblem(RoomFileCheck.Cause cause, String path, int disc) {
+    if (destroyed) return;
+    int text = cause == RoomFileCheck.Cause.IMAGE ? R.string.ingame_disc_image
+        : cause == RoomFileCheck.Cause.DEVICE ? R.string.ingame_disc_device
+        : cause == RoomFileCheck.Cause.READ ? R.string.ingame_disc_read : R.string.ingame_disc_unknown;
+    // the disc to import again: "Start screen" (it opens without starting the game) in place of "Quit"
+    boolean reimport = cause != RoomFileCheck.Cause.READ;
+    Immersive.show(new AlertDialog.Builder(this)
+        .setTitle(R.string.ingame_disc_title)
+        .setMessage(getString(text, path, disc))
+        .setPositiveButton(R.string.ingame_send_report, (dlg, w) -> shareReport())
+        .setNegativeButton(reimport ? R.string.ingame_start_screen : R.string.ingame_quit,
+            (dlg, w) -> { if (reimport) openStartScreen("disc " + disc + " to import again"); else quit(); })
+        .setNeutralButton(R.string.ingame_continue, null)
+        .setCancelable(false).create());
   }
 
   /** The menu's picture options to the renderer (applied at the next picture while the game runs). */
   private void applyGraphics() {
     SharedPreferences g = getSharedPreferences(GRAPHICS_PREFS, MODE_PRIVATE);
-    CoreBridge.setGraphics(g.getInt("scale", 0), g.getInt("samples", 1), g.getInt("anisotropy", 1),
+    CoreBridge.setGraphics(CoreMenu.scaleHalves(g), g.getInt("samples", 1), g.getInt("anisotropy", 1),
         g.getInt("aspect", 0));
+    TexturePacks.apply(this, g);
   }
 
   private void hideSystemUi() {
@@ -274,44 +643,163 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
     if (destroyed) return;
     touchControls.update();
     updateFps();
+    if (thermal != null) thermal.tick(SystemClock.elapsedRealtime());
     checkHang();
     checkCoreProcess();
+    checkDiscProblem();
+    checkFirstBenchmark();
+    checkShadows();
     int room = CoreBridge.wantedRoom();
     if (room >= 0 && room != preparedRoom && !roomBusy) prepareRoom(room);
     main.postDelayed(this::tick, 500);
   }
 
-  private void showFps(boolean on) {
-    fpsView.setVisibility(on && menuSupported ? View.VISIBLE : View.GONE);
-    fpsView.setText(getString(R.string.ingame_fps_none) + screenHz());
-    fpsFrames = -1;
+  // the real-time shadows' level last sent (-1 none yet) and its reason (checkShadows)
+  private int shadowLevel = -1;
+  private String shadowWhy = "";
+
+  /** The real-time shadows (RealtimeShadows; in every build since 16.11.2026, until then debug builds only): their
+   *  level from the device, the benchmark, the renderer, Potato's "Shadows & light" and the menu, sent to the renderer
+   *  and the core when it changes, with a line in the error log saying on or off and why. Each tick (the graphics chip
+   *  is known once the renderer runs, a benchmark changes the levels) and at once after the menu changed a switch; not
+   *  while the benchmark measures (it sets the Potato mask itself). */
+  private void checkShadows() {
+    if (benchFlow != null && benchFlow.running()) return;
+    SharedPreferences g = getSharedPreferences(GRAPHICS_PREFS, MODE_PRIVATE);
+    String[] why = new String[1];
+    int level = RealtimeShadows.level(g, perfDevice(), PerfProfile.Bench.of(g), surface instanceof VulkanSurface, why);
+    if (level == shadowLevel && why[0].equals(shadowWhy)) return;
+    boolean changed = level != shadowLevel;
+    shadowLevel = level;
+    shadowWhy = why[0];
+    Log.i(TAG, "real-time shadows: " + RealtimeShadows.logName(level) + " (" + why[0] + ")");
+    if (!changed) return;
+    CoreBridge.shadowBit = RealtimeShadows.coreBits(level);
+    CoreBridge.setShadows(level);
+    CoreBridge.setPotato(CoreBridge.potatoSent(g));
   }
 
-  /** " · 60 Hz": the screen's rate as measured (FramePacing), else as Android says; "" unknown. */
+  /** The FPS display's place (FPS_PLACE, else the old switch "fps": bottom left). */
+  static int fpsPlace(SharedPreferences graphics) {
+    int place = graphics.contains(FPS_PLACE) ? graphics.getInt(FPS_PLACE, 0) : graphics.getBoolean("fps", false) ? 1 : 0;
+    return place >= 0 && place < FPS_PLACES ? place : 0;
+  }
+
+  private void showFps(int place) {
+    fpsPlace = place;
+    hudFps = getString(R.string.ingame_fps_none);
+    showHud();
+    fpsFrames = -1;
+    placeFps();
+  }
+
+  /** The Information HUD's line with its parts as the menu's boxes say (InfoHud); hidden when off or none is chosen. */
+  private void showHud() {
+    SharedPreferences g = getSharedPreferences(GRAPHICS_PREFS, MODE_PRIVATE);
+    boolean time = InfoHud.shows(g, InfoHud.TIME);
+    String text = InfoHud.line(InfoHud.shows(g, InfoHud.FPS), hudFps, InfoHud.shows(g, InfoHud.HZ), screenHz(),
+        InfoHud.shows(g, InfoHud.RESOLUTION), resolution(),
+        time, time ? InfoHud.time(CoreBridge.cheatAction(InfoHud.PLAY_TIME_COMMAND)) : "");
+    fpsView.setText(text);
+    fpsView.setVisibility(fpsPlace != 0 && menuSupported && !text.isEmpty() ? View.VISIBLE : View.GONE);
+  }
+
+  /**
+   * The window's insets changed (laid out, turned by 180 degrees, the bars): the cutout's line into the error log when
+   * it says something new (Cutout.describe).
+   */
+  private void cutoutInsets(View root, WindowInsets insets) {
+    final int[] safe = Cutout.safe(insets);
+    final int[] at = new int[2];
+    root.getLocationOnScreen(at);
+    int screenWidth = 0, screenHeight = 0;
+    if (Build.VERSION.SDK_INT >= 30) {
+      final android.graphics.Rect b = getWindowManager().getMaximumWindowMetrics().getBounds();
+      screenWidth = b.width();
+      screenHeight = b.height();
+    } else {
+      final android.graphics.Point p = new android.graphics.Point();
+      getWindowManager().getDefaultDisplay().getRealSize(p);
+      screenWidth = p.x;
+      screenHeight = p.y;
+    }
+    final String line = Cutout.describe(root.getWidth(), root.getHeight(), at[0], at[1], screenWidth, screenHeight,
+        safe, Cutout.mode(Build.VERSION.SDK_INT), getWindow().getAttributes().layoutInDisplayCutoutMode);
+    if (!line.equals(cutoutLine) && root.getWidth() > 0) {
+      cutoutLine = line;
+      Log.i(TAG, line);
+    }
+  }
+
+  /** The FPS display at its place, kept clear of rounded corners, a cutout and bars that stay (CornerInset). */
+  private void placeFps() {
+    if (fpsInsets == null || fpsPlace == 0) return;
+    final boolean top = fpsPlace >= 3, centre = fpsPlace == 2 || fpsPlace == 4;
+    final int[] at = CornerInset.place(fpsInsets, getResources().getDisplayMetrics().density, CarDisplay.is(this), top, centre);
+    final FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) fpsView.getLayoutParams();
+    final int gravity = (top ? Gravity.TOP : Gravity.BOTTOM) | (centre ? Gravity.CENTER_HORIZONTAL : Gravity.LEFT);
+    final int left = centre ? 0 : at[0];
+    final int topMargin = top ? at[1] : 0, bottomMargin = top ? 0 : at[1];
+    if (lp.gravity != gravity || lp.leftMargin != left || lp.topMargin != topMargin || lp.bottomMargin != bottomMargin) {
+      lp.gravity = gravity;
+      lp.leftMargin = left;
+      lp.topMargin = topMargin;
+      lp.bottomMargin = bottomMargin;
+      fpsView.setLayoutParams(lp);
+      Log.i(TAG, "FPS display: place " + fpsPlace + ", " + (centre ? "centred" : left + " pixels from the left") + ", "
+          + at[1] + " from the " + (top ? "top" : "bottom"));
+    }
+  }
+
+  /**
+   * "1280×672 (2×)": the resolution the renderer draws at now, the level "Dynamic" chose too
+   * (wish of the project owner, 23.10.2026), the picture's rows as the menu counts them (336, 4:3
+   * 448); "" before the renderer started.
+   */
+  private String resolution() {
+    int[] info = CoreBridge.graphicsInfo();
+    if (info == null || info[2] < 2) return "";  // the level in halves (1.5×: 3)
+    int aspect = getSharedPreferences(GRAPHICS_PREFS, MODE_PRIVATE).getInt("aspect", 0);
+    int rows = CoreMenu.pictureRows(aspect, surface.getWidth(), surface.getHeight());
+    return String.format(Locale.ROOT, "%d×%d (%s×)", 640 * info[2] / 2, rows * info[2] / 2,
+        CoreMenu.scaleNumber(info[2], Locale.getDefault()));
+  }
+
+  /** "60 Hz": the screen's rate as measured (FramePacing), else as Android says; "" unknown. */
   private String screenHz() {
     double hz = pacing.hz();
     if (!(hz > 0)) {
       Display display = getWindowManager().getDefaultDisplay();
       hz = display != null ? display.getRefreshRate() : 0;
     }
-    return hz > 0 ? String.format(Locale.ROOT, " · %d Hz", Math.round(hz)) : "";
+    return hz > 0 ? String.format(Locale.ROOT, "%d Hz", Math.round(hz)) : "";
   }
 
-  /** The game's frames per second (one controller read per frame), counted over a second. */
+  /**
+   * The game's frames per second (one controller read per frame), counted over a second; with
+   * "60 FPS (experimental)" also the pictures on the screen, the in-between ones included (the game
+   * itself stays at 30; device test of the project owner, 22.10.2026).
+   */
   private void updateFps() {
-    if (fpsView.getVisibility() != View.VISIBLE) return;
-    long now = SystemClock.uptimeMillis(), frames = CoreBridge.gameFrames();
+    if (fpsPlace == 0 || !menuSupported) return;
+    long now = SystemClock.uptimeMillis(), frames = CoreBridge.gameFrames(), pictures = CoreBridge.pictures();
     if (frames < 0 || !resumed || menu != null || touchEditing) {
       fpsFrames = -1;  // the game stands: count anew afterwards
       return;
     }
     if (fpsFrames < 0) {
       fpsFrames = frames;
+      fpsPictures = pictures;
       fpsSince = now;
     } else if (now - fpsSince >= 1000) {
-      fpsView.setText(String.format(Locale.ROOT, getString(R.string.ingame_fps),
-          Math.round((frames - fpsFrames) * 1000.0 / (now - fpsSince))) + screenHz());
+      double seconds = (now - fpsSince) / 1000.0;
+      long game = Math.round((frames - fpsFrames) / seconds), shown = Math.round((pictures - fpsPictures) / seconds);
+      boolean smooth = getSharedPreferences(GRAPHICS_PREFS, MODE_PRIVATE).getBoolean("smooth60", false);
+      hudFps = smooth ? String.format(Locale.ROOT, getString(R.string.ingame_fps_smooth), game, shown)
+          : String.format(Locale.ROOT, getString(R.string.ingame_fps), game);
+      showHud();  // with the screen's rate, the resolution and the play time of now
       fpsFrames = frames;
+      fpsPictures = pictures;
       fpsSince = now;
     }
   }
@@ -321,12 +809,13 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
    * for 8 s while it is neither paused nor in the background, the error log
    * gets where its thread is (a loop or a wait that never ends).
    */
+  private boolean benchHeld;  // a benchmark popup holds the game (benchHost.hold)
   private void checkHang() {
     if (!menuSupported) return;
     long now = SystemClock.uptimeMillis();
     long frames = CoreBridge.gameFrames();
     if (frames < 0) return;
-    if (frames != lastFrames || !resumed || menu != null || touchEditing) {
+    if (frames != lastFrames || !resumed || menu != null || touchEditing || benchHeld) {
       if (frames != lastFrames) hangReported = false;  // the game moves (again)
       lastFrames = frames;
       framesSince = now;
@@ -347,8 +836,13 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
     rooms.execute(() -> {
       String path = "", error = "";
       String id = String.format(Locale.ROOT, "r%03x", room);
-      try (Reader rows = new InputStreamReader(getAssets().open("rooms.tsv"), StandardCharsets.UTF_8);
-           Reader blocks = new InputStreamReader(getAssets().open("blocks.tsv"), StandardCharsets.UTF_8)) {
+      // the verified rooms of the imported release (rooms.tsv / rooms-eu.tsv)
+      String release = com.ast.re4decomp.disc.DiscInstaller.release(new File(root, "disc1"));
+      if (release == null) release = com.ast.re4decomp.disc.GameCubeDisc.DEBUG;
+      try (Reader rows = new InputStreamReader(getAssets().open(com.ast.re4decomp.disc.GameCubeDisc.catalog("rooms", release)),
+               StandardCharsets.UTF_8);
+           Reader blocks = new InputStreamReader(getAssets().open(com.ast.re4decomp.disc.GameCubeDisc.catalog("blocks", release)),
+               StandardCharsets.UTF_8)) {
         RoomRepository repository = new RoomRepository(root, cache, rows, blocks,
             (source, output) -> NativeBridge.decodeRoom(source.getAbsolutePath(), output.getAbsolutePath()));
         path = repository.prepare(id).getAbsolutePath();
@@ -362,16 +856,51 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
   }
 
   private void askExit() {
-    new AlertDialog.Builder(this).setMessage(R.string.ingame_end_question)
+    Immersive.show(new AlertDialog.Builder(this).setMessage(R.string.ingame_end_question)
         .setPositiveButton(R.string.ingame_end, (d, w) -> quit())
-        .setNegativeButton(R.string.ingame_continue, null).show();
+        .setNegativeButton(R.string.ingame_continue, null).create());
   }
 
   private void quit() {
+    clearVulkanMark("the player ended the game");
     CoreLog.stop();
     finishAndRemoveTask();
     // the core cannot be restarted inside this process
     main.postDelayed(() -> System.exit(0), 300);
+  }
+
+  /**
+   * Management -> "Import other discs" and the disc problems (wish of the project owner, 06.11.2026: with both
+   * discs imported the launcher started the game at once and the game only ended, so another release could not be
+   * imported over the discs): the game ends as with quit(), and LauncherRestartActivity, in a process of its own,
+   * ends this one and opens the start screen in a new process without starting the game. Discs, saves, the memory
+   * card and the settings stay.
+   */
+  /**
+   * The menu's renderer (vulkan-bauplan.md E7): it takes a new process (the renderer and its surface are chosen at the
+   * start), so the game ends as with quit(), and LauncherRestartActivity ends this process and opens the game again.
+   */
+  private void restartIntoGame(String why) {
+    Log.i(TAG, "the app restarts into the game (" + why + ")");
+    clearVulkanMark("the app restarts");
+    CoreLog.stop();
+    startActivity(new Intent(this, LauncherRestartActivity.class)
+        .putExtra(LauncherRestartActivity.GAME_PID, Process.myPid())
+        .putExtra(LauncherRestartActivity.BACK_TO_GAME, true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+    finishAndRemoveTask();
+    new Handler(Looper.getMainLooper()).postDelayed(() -> System.exit(0), 3000);
+  }
+
+  private void openStartScreen(String why) {
+    Log.i(TAG, "the game ends, the start screen opens (" + why + ")");
+    clearVulkanMark("the game ends for the start screen");
+    CoreLog.stop();
+    startActivity(new Intent(this, LauncherRestartActivity.class)
+        .putExtra(LauncherRestartActivity.GAME_PID, Process.myPid()).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+    finishAndRemoveTask();
+    // LauncherRestartActivity ends this process; should it not come, the game ends as with quit() (a handler of its
+    // own: onDestroy empties `main`)
+    new Handler(Looper.getMainLooper()).postDelayed(() -> System.exit(0), 3000);
   }
 
   // --- the menu (SELECT) -------------------------------------------------------
@@ -380,6 +909,15 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
   private final Runnable selectHold = () -> {
     if (!selectDown || menu != null) return;
     selectHeld = true;
+    // the retail discs have no debug menu (decision of the project owner, 26.10.2026; the cheat menu
+    // of the in-game menu instead; the US and the Japanese discs lack the debug tools as well): holding
+    // SELECT says so and where another version's discs are imported (a user with the European discs held
+    // SELECT again and again and took it for the debug or US version not starting, 06.11.2026)
+    if (retail) {
+      Toast.makeText(this, R.string.ingame_debug_menu_retail, Toast.LENGTH_LONG).show();
+      Log.i(TAG, "SELECT held: no debug menu with the retail discs (said so)");
+      return;
+    }
     if (!menuSupported) {
       Toast.makeText(this, R.string.ingame_no_debug_menu,
           Toast.LENGTH_SHORT).show();
@@ -414,9 +952,11 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
     }
     releaseAll();
     boolean paused = CoreBridge.pause(true, 800);
+    keepGameAimInvert();
     audio.stop();
     stopVibrator();
-    Log.i(TAG, "menu open" + (paused ? ", the game stands" : ", the game did not stop yet (loading?)"));
+    Log.i(TAG, "menu open" + (paused ? ", the game stands" : ", the game did not stop yet (loading?)")
+        + " (" + language() + ")");
     menu = new CoreMenu(this, menuHost, tools, surface.getWidth(), surface.getHeight());
     menu.setOnDismissListener(d -> {
       menu = null;
@@ -429,8 +969,9 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
       }
       Log.i(TAG, "menu closed");
       surface.requestFocus();
+      main.post(this::updateMouseCapture);
     });
-    menu.show();
+    Immersive.show(menu);
   }
 
   private final CoreMenu.Host menuHost = new CoreMenu.Host() {
@@ -439,6 +980,35 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
     @Override public void exportAll() {
       startForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), REQUEST_EXPORT_ALL);
     }
+
+    @Override public void exportZip() {
+      // the card must be readable (the game neither saves nor loads), else no file is made
+      if (CoreBridge.cardList() == null) {
+        message(getString("busy".equals(CoreBridge.cardNote()) ? R.string.ingame_card_busy : R.string.ingame_card_unreadable));
+        return;
+      }
+      Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE)
+          .setType("application/zip").putExtra(Intent.EXTRA_TITLE, PlayerBackup.fileName(System.currentTimeMillis()));
+      startForResult(i, REQUEST_EXPORT_ZIP);
+    }
+
+    @Override public void wipePlayerData() {
+      PlayerWipe.request(CoreActivity.this);
+      Log.i(TAG, "menu: Delete All Data: the memory card and the instant save go at the restart, before the core");
+      restartIntoGame("all player data deleted");
+    }
+
+    @Override public void importDiscs() { openStartScreen("menu: import other discs"); }
+
+    @Override public void importTexturePack(TexturePacks.Listener listener) {
+      textureListener = listener;
+      startForResult(new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"),
+          REQUEST_TEXTURES);
+    }
+
+    @Override public void textureListener(TexturePacks.Listener listener) { textureListener = listener; }
+
+    @Override public void cancelTexturePackImport() { textureCancel.set(true); }
 
     @Override public void importFiles() {
       Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*")
@@ -461,12 +1031,16 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
       getSharedPreferences(INPUT_PREFS, MODE_PRIVATE).edit().putBoolean(R3_CAPTURE, on).apply();
     }
 
-    @Override public void fpsChanged(boolean on) { showFps(on); }
+    @Override public void fpsChanged(int place) { showFps(place); }
 
     @Override public void touchModeChanged(int mode) {
       getSharedPreferences(INPUT_PREFS, MODE_PRIVATE).edit().putInt(TOUCH_MODE, mode).apply();
       touchControls.setMode(mode);
     }
+
+    @Override public int touchLook() { return touchControls.look(); }
+
+    @Override public void touchLookChanged(int look) { touchControls.setLook(look); }
 
     @Override public void gyroChanged(boolean on) {
       getSharedPreferences(INPUT_PREFS, MODE_PRIVATE).edit().putBoolean(GYRO_AIM, on).apply();
@@ -476,8 +1050,192 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
     @Override public void latchChanged(boolean on) {
       getSharedPreferences(INPUT_PREFS, MODE_PRIVATE).edit().putBoolean(TOUCH_LATCH, on).apply();
       touchControls.setLatch(on);
+      input.setLatch(on, input.latchB());
       send();
-      Log.i(TAG, "touch controls: L and R " + (on ? "latch on a tap" : "held while touched"));
+      Log.i(TAG, "comfort controls: L and R " + (on ? "latch on a tap or a press" : "held while touched or pressed"));
+    }
+
+    @Override public void latchBChanged(boolean on) {
+      getSharedPreferences(INPUT_PREFS, MODE_PRIVATE).edit().putBoolean(TOUCH_LATCH_B, on).apply();
+      touchControls.setLatchB(on);
+      input.setLatch(input.latchLR(), on);
+      send();
+      Log.i(TAG, "comfort controls: B " + (on ? "latches on a tap or a press" : "held while touched or pressed"));
+    }
+
+    @Override public void touchAimChanged(int mode) {
+      getSharedPreferences(INPUT_PREFS, MODE_PRIVATE).edit().putInt(TOUCH_AIM, mode).apply();
+      input.setTouchAim(mode);
+      send();
+      Log.i(TAG, "touch aiming: " + (mode == CoreInput.AIM_LOOK ? "the touch area" : mode == CoreInput.AIM_C_STICK
+          ? "the touch C stick" : "the move stick") + " aims while L or R is held");
+    }
+
+    @Override public void gyroSensitivityChanged(float value) {
+      getSharedPreferences(INPUT_PREFS, MODE_PRIVATE).edit().putFloat(GYRO_SENSITIVITY, value).apply();
+      gyroAim.setSensitivity(value);
+    }
+
+    @Override public void gyroInvertChanged(boolean vertical, boolean on) {
+      SharedPreferences prefs = getSharedPreferences(INPUT_PREFS, MODE_PRIVATE);
+      prefs.edit().putBoolean(vertical ? GYRO_INVERT_V : GYRO_INVERT_H, on).apply();
+      gyroAim.setInvert(prefs.getBoolean(GYRO_INVERT_V, false), prefs.getBoolean(GYRO_INVERT_H, false));
+    }
+
+    @Override public void knifeSwipeChanged(boolean on) {
+      getSharedPreferences(INPUT_PREFS, MODE_PRIVATE).edit().putBoolean(KNIFE_SWIPE, on).apply();
+      knifeSwipe = on;
+      Log.i(TAG, "touch: swipes " + (on ? "draw the knife and slash" : "leave the knife alone"));
+    }
+
+    @Override public void checkUpdate(AppUpdate.Listener listener) {
+      // the car flavor comes from Google Play, which updates it: no button (UNKNOWN hides it)
+      if (!getResources().getBoolean(R.bool.app_update)) {
+        listener.checked(AppUpdate.UNKNOWN);
+        return;
+      }
+      AppUpdate.check(CoreActivity.this, listener);
+    }
+
+    @Override public void openUpdate() { AppUpdate.open(CoreActivity.this); }
+
+    @Override public void aimInvertChanged(boolean on) {
+      getSharedPreferences(INPUT_PREFS, MODE_PRIVATE).edit().putBoolean(AIM_INVERT_V, on).apply();
+      aimInvert = on;
+      CoreBridge.setAim(aimInvert, aimSpeed, autoAim, alwaysRun);
+    }
+
+    @Override public void autoAimChanged(boolean on) {
+      getSharedPreferences(INPUT_PREFS, MODE_PRIVATE).edit().putBoolean(AUTO_AIM, on).apply();
+      autoAim = on;
+      CoreBridge.setAim(aimInvert, aimSpeed, autoAim, alwaysRun);
+    }
+
+    @Override public void alwaysRunChanged(boolean on) {
+      getSharedPreferences(INPUT_PREFS, MODE_PRIVATE).edit().putBoolean(ALWAYS_RUN, on).apply();
+      alwaysRun = on;
+      CoreBridge.setAim(aimInvert, aimSpeed, autoAim, alwaysRun);
+    }
+
+    @Override public void bodyTurnChanged(boolean on) {
+      getSharedPreferences(INPUT_PREFS, MODE_PRIVATE).edit().putBoolean(BODY_TURN, on).apply();
+      input.setBodyTurn(on);
+      Log.i(TAG, "turn Leon with mouse / look area: " + (on ? "on" : "off"));
+    }
+
+    @Override public void gentleQteChanged(boolean on) {
+      getSharedPreferences(INPUT_PREFS, MODE_PRIVATE).edit().putBoolean(GENTLE_QTE, on).apply();
+      CoreBridge.setGentleQte(on);
+      Log.i(TAG, "gentler QTEs " + (on ? "on: Professional's quick-time events as Normal's" : "off"));
+    }
+
+    @Override public void stickShapeChanged(int deadZone, int range) {
+      input.setStickShape(deadZone, range);
+      stickWatch.setShape(input.deadZone(), input.range());
+      getSharedPreferences(INPUT_PREFS, MODE_PRIVATE).edit().putInt(STICK_DEAD_ZONE, input.deadZone())
+          .putInt(STICK_RANGE, input.range()).apply();
+      Log.i(TAG, "sticks: dead zone " + input.deadZone() + " %, range " + input.range() + " %");
+    }
+
+    @Override public void vibrationChanged(int mode) {
+      rumbleMode = RumbleTarget.clampMode(mode);
+      getSharedPreferences(INPUT_PREFS, MODE_PRIVATE).edit().putInt(VIBRATION, rumbleMode).apply();
+      chooseRumble("the menu");
+    }
+
+    @Override public void aimSpeedChanged(float value) {
+      aimSpeed = clampAimSpeed(value);
+      getSharedPreferences(INPUT_PREFS, MODE_PRIVATE).edit().putFloat(AIM_SPEED, aimSpeed).apply();
+      CoreBridge.setAim(aimInvert, aimSpeed, autoAim, alwaysRun);
+    }
+
+    @Override public boolean gameLanguages() { return retailEu; }
+    @Override public boolean debugMenu() { return !retail; }
+    @Override public void startBenchmark() { benchFlow.start(false); }
+    @Override public PerfProfile.Device perfDevice() { return CoreActivity.this.perfDevice(); }
+    @Override public void shadowsChanged() { checkShadows(); }
+    @Override public void profileChosen(int profile) {
+      SharedPreferences g = getSharedPreferences(GRAPHICS_PREFS, MODE_PRIVATE);
+      PerfProfile.Device d = perfDevice();
+      PerfProfile.choose(g, profile, profile == PerfProfile.CUSTOM ? null
+          : PerfProfile.values(profile, d, PerfProfile.Bench.of(g)));
+      Log.i(TAG, "performance profile " + profile + ": " + BenchmarkFlow.describe(PerfProfile.current(g)));
+      applyOptions();
+    }
+
+    @Override public int gameLanguageOf(int choice) { return CoreActivity.gameLanguageOf(choice); }
+
+    @Override public void gameLanguageChanged(int choice) {
+      getSharedPreferences(GAME_PREFS, MODE_PRIVATE).edit().putInt(GAME_LANGUAGE, choice).apply();
+      int language = gameLanguageOf(choice);
+      Log.i(TAG, "game language: " + language + (choice == 0 ? " (the device's)" : "")
+          + (language != gameLanguageNow ? ", the game restarts" : ""));
+      if (language != gameLanguageNow) {
+        gameLanguageNow = language;
+        CoreBridge.restartGame(language);
+      }
+    }
+
+    @Override public void cheatsChanged(int bits) {
+      getSharedPreferences(GAME_PREFS, MODE_PRIVATE).edit().putInt(CHEATS, bits).apply();
+      Log.i(TAG, "cheats: " + bits + " (1 health, 2 ammo, 4 one-hit kill, 8 automatic QTEs, 16 extra games kept, player type "
+          + ((bits & CoreMenu.CHARACTER_BITS) >> CoreMenu.CHARACTER_SHIFT)
+          + ((bits & CoreMenu.COSTUME_BIT) != 0 ? ", special costume" : "")
+          + ((bits & CoreMenu.INVISIBLE_BIT) != 0 ? ", invisibility" : "")
+          + ((bits & CoreMenu.RANDOM_ITEMS_BIT) != 0 ? ", random items with seed "
+              + ((bits & CoreMenu.SEED_BITS) >>> CoreMenu.SEED_SHIFT) : "") + ")");
+      CoreBridge.setCheats(bits);
+    }
+
+    @Override public void leonJacketChanged(boolean on) {
+      getSharedPreferences(GAME_PREFS, MODE_PRIVATE).edit().putBoolean(LEON_JACKET, on).apply();
+      Log.i(TAG, "cheats: Leon's jacket " + (on ? "on" : "off"));
+      CoreBridge.setLeonJacket(on);
+    }
+
+    @Override public void enemyRandomChanged(int seed) {
+      getSharedPreferences(GAME_PREFS, MODE_PRIVATE).edit().putInt(ENEMY_SEED, seed).apply();
+      Log.i(TAG, "cheats: random enemies " + (seed != 0 ? "on with seed " + seed : "off"));
+      CoreBridge.setEnemyRandom(seed);
+    }
+
+    @Override public void restartGame() {
+      Log.i(TAG, "the game restarts (extra games), its language stays");
+      CoreBridge.restartGame(0);
+    }
+
+    @Override public boolean vulkanSupported() { return CoreActivity.this.vulkanSupported(); }
+
+    @Override public boolean vulkanRunning() { return surface instanceof VulkanSurface; }
+    @Override public double displayHz() {
+      double hz = pacing.hz();
+      if (!(hz > 0)) {
+        Display display = getWindowManager().getDefaultDisplay();
+        hz = display != null ? display.getRefreshRate() : 0;
+      }
+      return hz;
+    }
+
+    @Override public boolean vulkanChosen() {
+      return "vulkan".equals(getSharedPreferences(GRAPHICS_PREFS, MODE_PRIVATE).getString(RENDERER, "gles"));
+    }
+
+    @Override public void clearShaderCache() {
+      // emptied at the next start, before the core opens the folder (the renderer has its files open now)
+      ShaderCache.requestClear(CoreActivity.this);
+      restartIntoGame("shader cache cleared");
+    }
+
+    @Override public void rendererChanged(boolean on) {
+      getSharedPreferences(GRAPHICS_PREFS, MODE_PRIVATE).edit().putString(RENDERER, on ? "vulkan" : "gles")
+          .putBoolean(VULKAN_STARTING, false).commit();
+      restartIntoGame("renderer " + (on ? "Vulkan" : "OpenGL ES"));
+    }
+
+    @Override public int cheatAction(int what) {
+      int result = CoreBridge.cheatAction(what);
+      Log.i(TAG, "cheat button " + what + ": " + result);
+      return result;
     }
 
     @Override public void alternateChanged(boolean on) {
@@ -486,13 +1244,57 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
       send();
       logLayout();
     }
+
+    @Override public void mappingChanged(ActionMap map) {
+      String text = map.encode();
+      String key = map.kind == ActionMap.KIND_KEYBOARD ? BINDINGS_KEYBOARD : BINDINGS_CONTROLLER;
+      SharedPreferences.Editor e = getSharedPreferences(INPUT_PREFS, MODE_PRIVATE).edit();
+      if (text == null) e.remove(key); else e.putString(key, text);
+      e.apply();
+      if (map.kind == ActionMap.KIND_KEYBOARD) input.setKeyboardMap(map); else input.setControllerMap(map);
+      send();
+      logLayout();
+    }
+
+    @Override public ActionMap mapping(int kind) {
+      return kind == ActionMap.KIND_KEYBOARD ? input.keyboardMap() : input.controllerMap();
+    }
+
+    @Override public int faceLabel(int keyCode) { return input.faceLabel(keyCode); }
+
+    @Override public boolean controllerConnected() {
+      for (int id : InputDevice.getDeviceIds()) if (gameDevice(InputDevice.getDevice(id))) return true;
+      return false;
+    }
+
+    @Override public boolean keyboardConnected() {
+      for (int id : InputDevice.getDeviceIds()) {
+        InputDevice d = InputDevice.getDevice(id);
+        if (keyboardDevice(d) || mouseDevice(d)) return true;
+      }
+      return false;
+    }
+
+    @Override public float mouseSensitivity() { return mouseSensitivity; }
+
+    @Override public void mouseSensitivityChanged(float value) {
+      mouseSensitivity = clampMouse(value);
+      getSharedPreferences(INPUT_PREFS, MODE_PRIVATE).edit().putFloat(MOUSE_SENSITIVITY, mouseSensitivity).apply();
+      Log.i(TAG, "mouse: sensitivity " + mouseSensitivity);
+    }
   };
 
   private void logLayout() {
+    // the controller's own mapping (not with the alternate controls) and the keyboard's
+    String extra = (input.ownControllerMap() && !input.alternate()
+        ? "; own controller mapping (in the game, the menus keep the layout): "
+            + input.controllerMap().describe(CoreMenu::keyName) : "")
+        + "; keyboard: " + (input.keyboardMap().isDefault() ? "default" : "own")
+        + " mapping: " + input.keyboardMap().describe(CoreMenu::keyName);
     Log.i(TAG, "layout: A B X Y by label" + (input.swapFace() ? ", A/B and X/Y swapped" : "")
         + (input.alternate() ? ", alternate controls: L1 = L, L2 = R, R1 = Y, R2 = A, Y = Z, aiming with the right stick"
             : ", R2 = R, L2 = L, R1 = Z")
-        + ", SELECT menu (held: debug menu), R3 " + (tools ? "graphics capture" : "unused")
+        + ", SELECT menu" + (retail ? "" : " (held: debug menu)") + ", R3 " + (tools ? "graphics capture" : "unused") + extra
         + (menuSupported ? "" : "; this core has no menu functions"));
   }
 
@@ -509,14 +1311,58 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
 
     @Override public void editing(boolean on) { touchEditing(on); }
 
-    @Override public void send() { CoreActivity.this.send(); }
+    @Override public void send() {
+      benchTouch();
+      CoreActivity.this.send();
+    }
+
+    @Override public void r3(boolean down) {
+      Log.i(TAG, "touch R3 -> app " + (tools ? "graphics capture" : "nothing (tools off)"));
+      if (down) capture();
+    }
+
+    // the touch zoom buttons (0.99.15, GitHub #247): a notch of the wheel at once and every ZOOM_REPEAT_MS while held
+    @Override public void zoom(int direction, boolean down) {
+      main.removeCallbacks(touchZoom);
+      touchZoomDirection = down ? direction : 0;
+      if (!down) return;
+      if (touchZoomLines++ < 10) {
+        Log.i(TAG, "touch zoom " + (direction > 0 ? "in" : "out")
+            + (input.zoomView() ? " (the scope or the binoculars)" : " (no scope, no binoculars: nothing)"));
+      }
+      touchZoom.run();
+    }
   };
+
+  /** While a touch zoom button is held: a notch, again after ZOOM_REPEAT_MS (an eighth of the zoom each). */
+  private static final long ZOOM_REPEAT_MS = 150;
+  private int touchZoomDirection, touchZoomLines;
+  private final Runnable touchZoom = new Runnable() {
+    @Override public void run() {
+      if (touchZoomDirection == 0 || destroyed) return;
+      CoreBridge.zoom(touchZoomDirection);
+      main.postDelayed(this, ZOOM_REPEAT_MS);
+    }
+  };
+
+  /**
+   * R3 (the controller's right stick pressed, or the touch controls' R3): the graphics data of the
+   * next pictures for the diagnosis in the cloud (files/gx-dumps, test-core-app.ps1 /
+   * pull-gx-dumps.ps1 fetch them); only with "R3 = Graphics capture" or the test scripts' tools.
+   */
+  private void capture() {
+    if (!tools) return;
+    File dir = AppStorage.base(this);
+    CoreBridge.gxDump(new File(dir, "gx-dumps").getAbsolutePath());
+    Toast.makeText(this, R.string.ingame_capture_saved, Toast.LENGTH_SHORT).show();
+  }
 
   /** RetroTouch's editor (its gear) opened or closed: the game stands while the player arranges the controls. */
   private void touchEditing(boolean on) {
     touchEditing = on;
     input.clear();
     send();
+    updateMouseCapture();
     if (!menuSupported) return;
     if (on) {
       boolean paused = CoreBridge.pause(true, 800);
@@ -541,7 +1387,7 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
   }
 
   private void message(String text) {
-    new AlertDialog.Builder(this).setMessage(text).setPositiveButton(android.R.string.ok, null).show();
+    Immersive.show(new AlertDialog.Builder(this).setMessage(text).setPositiveButton(android.R.string.ok, null).create());
   }
 
   @Override
@@ -551,8 +1397,14 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
     try {
       if (request == REQUEST_EXPORT_ALL && data.getData() != null) {
         exportAllInto(data.getData());
+      } else if (request == REQUEST_EXPORT_ZIP && data.getData() != null) {
+        exportZipInto(data.getData());
+      } else if (request == REQUEST_TEXTURES && data.getData() != null) {
+        importTextures(data.getData());
       } else if (request == REQUEST_IMPORT) {
         pendingImports.clear();
+        pendingTouch = pendingInstant = pendingSettings = pendingManifest = null;
+        importedSettings = false;
         if (data.getClipData() != null) {
           for (int i = 0; i < data.getClipData().getItemCount(); i++) readImport(data.getClipData().getItemAt(i).getUri());
         } else if (data.getData() != null) {
@@ -572,6 +1424,43 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
     }
   }
 
+  /** The chosen texture pack into the textures folder (TexturePacks.importFrom) on a thread of its own; the menu hears
+   *  its progress and its end; the pack is in use right after. */
+  private void importTextures(Uri uri) {
+    if (TexturePacks.importing) return;
+    TexturePacks.importing = true;
+    TexturePacks.importDone = 0;
+    TexturePacks.importTotal = 0;
+    textureCancel.set(false);
+    final android.content.Context app = getApplicationContext();
+    Thread t = new Thread(() -> {
+      TexturePacks.Info info = null;
+      TexturePacks.PackException failure = null;
+      try {
+        info = TexturePacks.importFrom(app, uri, textureCancel, new TexturePacks.Listener() {
+          @Override public void progress(long done, long total) {
+            main.post(() -> { if (textureListener != null) textureListener.progress(done, total); });
+          }
+          @Override public void done(TexturePacks.Info i, TexturePacks.PackException f) {}
+        });
+      } catch (TexturePacks.PackException e) {
+        failure = e;
+      } catch (java.io.IOException e) {
+        failure = new TexturePacks.PackException(TexturePacks.READ_FAILED, String.valueOf(e.getMessage()));
+      }
+      final TexturePacks.Info result = info;
+      final TexturePacks.PackException problem = failure;
+      main.post(() -> {
+        TexturePacks.importing = false;
+        if (result != null) getSharedPreferences(GRAPHICS_PREFS, MODE_PRIVATE).edit().putBoolean(TexturePacks.ON, true).apply();
+        TexturePacks.apply(this, getSharedPreferences(GRAPHICS_PREFS, MODE_PRIVATE));
+        Log.i(TAG, "texture pack import: " + (problem == null ? "done" : problem.getMessage()));
+        if (textureListener != null) textureListener.done(result, problem);
+      });
+    }, "texture-import");
+    t.start();
+  }
+
   /** Every file of the card as .gci into the chosen folder. */
   private void exportAllInto(Uri tree) throws IOException {
     String[] rows = CoreBridge.cardList();
@@ -580,6 +1469,11 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
       return;
     }
     Uri folder = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
+    // the player's own touch layout as a file of its own (wish of the project owner, 07.11.2026); none: nothing
+    int[] screen = touchScreen();
+    byte[] touchFile = TouchLayoutFile.export(touchPrefs(), TouchControls.defaultLayout(), touchWindowDefaults(),
+        screen[0], screen[1], touchSafe(),
+        appVersion());
     int done = 0;
     StringBuilder problems = new StringBuilder();
     for (String row : rows) {
@@ -598,16 +1492,74 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
       }
       done++;
     }
+    String touchLine = "";
+    if (touchFile != null) {
+      Uri file = DocumentsContract.createDocument(getContentResolver(), folder, "application/json", TouchLayoutFile.NAME);
+      if (file == null) throw new IOException(TouchLayoutFile.NAME);
+      try (OutputStream out = getContentResolver().openOutputStream(file)) {
+        if (out == null) throw new IOException(TouchLayoutFile.NAME);
+        out.write(touchFile);
+      }
+      touchLine = "\n" + getString(R.string.ingame_exported_touch, TouchLayoutFile.NAME);
+      Log.i(TAG, "export: the touch layout too (" + touchFile.length + " bytes, screen " + screen[0] + "x" + screen[1] + ")");
+    }
     message(String.format(java.util.Locale.ROOT, getResources().getQuantityString(R.plurals.ingame_exported, done), done)
-        + problems);
+        + touchLine + problems);
+  }
+
+  /** RetroTouch's preferences (TouchLayoutFile.PREFS: the saved layout). */
+  private SharedPreferences touchPrefs() {
+    return getSharedPreferences(TouchLayoutFile.PREFS, Context.MODE_PRIVATE);
+  }
+
+  /** The camera cutout's safe insets the touch layouts follow (TouchFrame; zeros without touch controls). */
+  private int[] touchSafe() {
+    return touchControls != null ? touchControls.safeInsets() : new int[4];
+  }
+
+  /** The default touch layout of this window, laid into the camera's safe area (TouchControls.windowDefaults). */
+  private com.ast.retrotouch.RetroTouchLayout touchWindowDefaults() {
+    return touchControls != null ? touchControls.windowDefaults() : TouchControls.defaultLayout();
+  }
+
+  /** The touch controls' size in pixels (the window, else the display): what RetroTouch's parts refer to. */
+  private int[] touchScreen() {
+    View v = touchControls != null ? touchControls.view() : null;
+    if (v != null && v.getWidth() > 0 && v.getHeight() > 0) return new int[] {v.getWidth(), v.getHeight()};
+    View d = getWindow().getDecorView();
+    if (d.getWidth() > 0 && d.getHeight() > 0) return new int[] {d.getWidth(), d.getHeight()};
+    android.util.DisplayMetrics m = getResources().getDisplayMetrics();
+    return new int[] {m.widthPixels, m.heightPixels};
+  }
+
+  /** The app's version ("0.99.2-rc"), for the touch layout file. */
+  private String appVersion() {
+    try {
+      return AppUpdate.plain(getPackageManager().getPackageInfo(getPackageName(), 0).versionName);
+    } catch (android.content.pm.PackageManager.NameNotFoundException e) {
+      return "";
+    }
   }
 
   private void readImport(Uri uri) throws IOException {
     try (InputStream in = getContentResolver().openInputStream(uri)) {
       if (in == null) throw new IOException(String.valueOf(uri));
-      byte[] gci = CoreLog.readAll(in);
-      if (gci.length > 4 << 20) throw new IOException("too big for a .gci");
-      pendingImports.add(gci);
+      // a .gci, a whole Dolphin card (.raw, .gcp) or a ZIP of either: the .gci files of this game
+      StringBuilder found = new StringBuilder();
+      try {
+        SaveImport.Found parts = SaveImport.read(CoreLog.readAll(in), found);
+        pendingImports.addAll(parts.gci);
+        if (!parts.touch.isEmpty()) pendingTouch = parts.touch.get(parts.touch.size() - 1);
+        // the app's own ZIP (PlayerBackup): its instant save and its settings with its manifest
+        if (parts.instant != null) pendingInstant = parts.instant;
+        if (parts.settings != null) {
+          pendingSettings = parts.settings;
+          pendingManifest = parts.manifest;
+        }
+      } catch (IllegalArgumentException e) {
+        throw new IOException(e.getMessage());
+      }
+      if (found.length() > 0) Log.i(TAG, "import: " + found);
     }
   }
 
@@ -634,8 +1586,33 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
   /** The chosen .gci files one by one; a file already on the card is replaced only when asked. */
   private void importNext(StringBuilder report) {
     if (pendingImports.isEmpty()) {
-      if (report.length() > 0) message(report.toString().trim());
+      if (pendingTouch != null) {
+        importTouch(report);
+        return;
+      }
+      if (pendingInstant != null) {
+        importInstant(report);
+        return;
+      }
+      if (pendingSettings != null) {
+        importSettings(report);
+        return;
+      }
       if (menu != null) menu.refreshCard();
+      if (importedSettings) {
+        // the settings are in place: most take effect at the next start of the game (renderer, language, the
+        // controls the activity keeps), so it offers the restart (progress not saved is lost)
+        importedSettings = false;
+        Immersive.show(new AlertDialog.Builder(this)
+            .setMessage(report.toString().trim() + "\n\n" + getString(R.string.ingame_backup_restart))
+            .setPositiveButton(R.string.ingame_restart, (d, w) -> {
+              if (menu != null) menu.dismiss();
+              restartIntoGame("settings imported");
+            })
+            .setNegativeButton(R.string.ingame_later, null).create());
+        return;
+      }
+      if (report.length() > 0) message(report.toString().trim());
       return;
     }
     byte[] gci = pendingImports.remove(0);
@@ -643,7 +1620,7 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
     int r = CoreBridge.cardImport(gci, false);
     Log.i(TAG, "import " + name + ": " + r + " " + CoreBridge.cardNote());
     if (r == CoreBridge.CARD_EXISTS) {
-      new AlertDialog.Builder(this)
+      Immersive.show(new AlertDialog.Builder(this)
           .setMessage(getString(R.string.ingame_import_exists, name))
           .setPositiveButton(R.string.ingame_replace, (d, w) -> {
             int again = CoreBridge.cardImport(gci, true);
@@ -652,11 +1629,281 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
             importNext(report);
           })
           .setNegativeButton(R.string.ingame_skip, (d, w) -> importNext(report))
-          .setCancelable(false).show();
+          .setCancelable(false).create());
       return;
     }
     report.append(importText(r, name)).append('\n');
     importNext(report);
+  }
+
+  /**
+   * The touch layout of the import, after its .gci files: replaces the player's own only when asked; in use at once
+   * (TouchControls.reloadSaved), every control on this screen.
+   */
+  private void importTouch(StringBuilder report) {
+    byte[] file = pendingTouch;
+    pendingTouch = null;
+    TouchLayoutFile.Parsed parsed;
+    try {
+      parsed = TouchLayoutFile.parse(file);
+    } catch (IllegalArgumentException e) {
+      Log.i(TAG, "import: touch layout: " + e.getMessage());
+      report.append(getString(R.string.ingame_touch_import_bad, e.getMessage())).append('\n');
+      importNext(report);
+      return;
+    }
+    SharedPreferences prefs = touchPrefs();
+    if (TouchLayoutFile.ownSaved(prefs, TouchControls.defaultLayout(), touchWindowDefaults())
+        && !TouchLayoutFile.sameAsSaved(prefs, parsed)) {
+      Immersive.show(new AlertDialog.Builder(this)
+          .setMessage(R.string.ingame_touch_import_exists)
+          .setPositiveButton(R.string.ingame_replace, (d, w) -> {
+            applyTouch(parsed, report);
+            importNext(report);
+          })
+          .setNegativeButton(R.string.ingame_skip, (d, w) -> {
+            Log.i(TAG, "import: touch layout skipped (the player's own kept)");
+            report.append(getString(R.string.ingame_touch_skipped)).append('\n');
+            importNext(report);
+          })
+          .setCancelable(false).create());
+      return;
+    }
+    applyTouch(parsed, report);
+    importNext(report);
+  }
+
+  /** The instant save of the app's ZIP (PlayerBackup): replaces the player's only when asked; the core reads the slot
+   *  file at each look at it (runtime/instant_store.cpp), so it is in use at once. */
+  private void importInstant(StringBuilder report) {
+    byte[] file = pendingInstant;
+    pendingInstant = null;
+    String problem = PlayerBackup.instantProblem(file);
+    ImportManager imports = ((Re4Application) getApplication()).imports;
+    if (problem == null && imports.root == null) problem = "no data folder";
+    if (problem != null) {
+      Log.i(TAG, "import: instant save: " + problem);
+      report.append(getString(R.string.ingame_backup_instant_bad, problem)).append('\n');
+      importNext(report);
+      return;
+    }
+    File slot = PlayerBackup.instantFile(imports.root);
+    byte[] now = null;
+    try {
+      now = PlayerBackup.read(slot, PlayerBackup.INSTANT_BYTES + 1);
+    } catch (IOException e) {
+      Log.i(TAG, "import: the instant save there cannot be read: " + e);
+    }
+    if (now != null && java.util.Arrays.equals(now, file)) {
+      Log.i(TAG, "import: instant save: the same as the one there");
+      report.append(getString(R.string.ingame_backup_instant_imported)).append('\n');
+      importNext(report);
+      return;
+    }
+    if (now != null && PlayerBackup.instantProblem(now) == null) {
+      Immersive.show(new AlertDialog.Builder(this)
+          .setMessage(R.string.ingame_backup_instant_exists)
+          .setPositiveButton(R.string.ingame_replace, (d, w) -> {
+            writeInstant(slot, file, report);
+            importNext(report);
+          })
+          .setNegativeButton(R.string.ingame_skip, (d, w) -> {
+            Log.i(TAG, "import: instant save skipped (the player's kept)");
+            report.append(getString(R.string.ingame_backup_instant_skipped)).append('\n');
+            importNext(report);
+          })
+          .setCancelable(false).create());
+      return;
+    }
+    writeInstant(slot, file, report);
+    importNext(report);
+  }
+
+  private void writeInstant(File slot, byte[] file, StringBuilder report) {
+    try {
+      PlayerBackup.writeAtomically(slot, file);
+      Log.i(TAG, "import: instant save written (" + file.length + " bytes)");
+      report.append(getString(R.string.ingame_backup_instant_imported)).append('\n');
+    } catch (IOException e) {
+      Log.w(TAG, "import: instant save: " + e);
+      report.append(getString(R.string.ingame_backup_instant_bad, e.getMessage())).append('\n');
+    }
+  }
+
+  /** The settings of the app's ZIP (PlayerBackup.plan): replace this app's only when asked; the graphics only from the
+   *  same kind of device; from a newer version only what this one has. */
+  private void importSettings(StringBuilder report) {
+    byte[] file = pendingSettings;
+    byte[] manifest = pendingManifest;
+    pendingSettings = pendingManifest = null;
+    PlayerBackup.Origin from = PlayerBackup.Origin.of(file);
+    if (from == null) from = PlayerBackup.Origin.of(manifest);
+    long code = appVersionCode();
+    boolean newer = from != null && from.code > code;
+    boolean sameDevice = from != null && deviceName().equals(from.device);
+    java.util.Map<String, java.util.Map<String, ?>> current = new java.util.LinkedHashMap<>();
+    for (String group : PlayerBackup.GROUPS) current.put(group, getSharedPreferences(group, MODE_PRIVATE).getAll());
+    final List<PlayerBackup.Plan> plans;
+    StringBuilder log = new StringBuilder();
+    try {
+      plans = PlayerBackup.plan(file, current, newer, sameDevice, log);
+    } catch (IllegalArgumentException e) {
+      Log.i(TAG, "import: settings: " + e.getMessage());
+      report.append(getString(R.string.ingame_backup_settings_bad, e.getMessage())).append('\n');
+      importNext(report);
+      return;
+    }
+    int changes = 0, skipped = 0;
+    for (PlayerBackup.Plan p : plans) {
+      changes += p.put.size() + p.remove.size();
+      skipped += p.skipped;
+      log.append(' ').append(p.group).append(": ").append(p.put.size()).append(" set, ").append(p.remove.size())
+          .append(" back to the default, ").append(p.skipped).append(" left out")
+          .append(p.keptPerformance > 0 ? ", " + p.keptPerformance + " performance settings of this device kept" : "")
+          .append(';');
+    }
+    Log.i(TAG, "import: settings of " + (from != null ? from.app + " (" + from.code + ") on " + from.device : "?")
+        + ":" + log);
+    final String notes = settingsNotes(from, newer, sameDevice, plans, skipped);
+    if (changes == 0) {
+      report.append(getString(R.string.ingame_backup_settings_same)).append('\n').append(notes);
+      importNext(report);
+      return;
+    }
+    Immersive.show(new AlertDialog.Builder(this)
+        .setMessage(R.string.ingame_backup_settings_exists)
+        .setPositiveButton(R.string.ingame_replace, (d, w) -> {
+          for (PlayerBackup.Plan p : plans) PlayerBackup.apply(getSharedPreferences(p.group, MODE_PRIVATE), p);
+          importedSettings = true;
+          Log.i(TAG, "import: settings replaced");
+          report.append(getString(R.string.ingame_backup_settings_imported)).append('\n').append(notes);
+          importNext(report);
+        })
+        .setNegativeButton(R.string.ingame_skip, (d, w) -> {
+          Log.i(TAG, "import: settings skipped (the player's kept)");
+          report.append(getString(R.string.ingame_backup_settings_skipped)).append('\n');
+          importNext(report);
+        })
+        .setCancelable(false).create());
+  }
+
+  /** The lines under "Settings imported": the performance settings kept (another device), a newer version's left
+   *  out. */
+  private String settingsNotes(PlayerBackup.Origin from, boolean newer, boolean sameDevice,
+                               List<PlayerBackup.Plan> plans, int skipped) {
+    StringBuilder t = new StringBuilder();
+    int kept = 0;
+    for (PlayerBackup.Plan p : plans) kept += p.keptPerformance;
+    if (!sameDevice && kept > 0) {
+      t.append(getString(R.string.ingame_backup_graphics_kept, from != null && !from.device.isEmpty() ? from.device : "?"))
+          .append('\n');
+    }
+    if (newer && skipped > 0) {
+      t.append(getString(R.string.ingame_backup_newer, from.app)).append('\n');
+    }
+    return t.toString();
+  }
+
+  /** Every file of the card as .gci, the touch layout, the instant save and the settings in one ZIP (PlayerBackup). */
+  private void exportZipInto(Uri uri) throws IOException {
+    String[] rows = CoreBridge.cardList();
+    if (rows == null) {
+      // the card became busy meanwhile: no half backup
+      try { DocumentsContract.deleteDocument(getContentResolver(), uri); } catch (Exception ignored) {}
+      message(getString(R.string.ingame_card_unreadable));
+      return;
+    }
+    PlayerBackup.Contents c = new PlayerBackup.Contents();
+    StringBuilder problems = new StringBuilder();
+    for (String row : rows) {
+      int index = Integer.parseInt(row.split("\t", 2)[0]);
+      String name = CoreBridge.cardFileName(index);
+      byte[] gci = CoreBridge.cardExport(index);
+      if (gci == null || name == null) {
+        problems.append('\n').append(CoreBridge.cardNote());
+        continue;
+      }
+      c.card(name, gci);
+    }
+    int[] screen = touchScreen();
+    c.touch = TouchLayoutFile.export(touchPrefs(), TouchControls.defaultLayout(), touchWindowDefaults(),
+        screen[0], screen[1], touchSafe(), appVersion());
+    ImportManager imports = ((Re4Application) getApplication()).imports;
+    if (imports.root != null) {
+      byte[] instant = PlayerBackup.read(PlayerBackup.instantFile(imports.root), PlayerBackup.INSTANT_BYTES + 1);
+      String problem = instant == null ? null : PlayerBackup.instantProblem(instant);
+      if (problem == null) c.instant = instant;
+      else Log.i(TAG, "export: the instant save left out (" + problem + ")");
+    }
+    java.util.Map<String, java.util.Map<String, ?>> groups = new java.util.LinkedHashMap<>();
+    for (String group : PlayerBackup.GROUPS) groups.put(group, getSharedPreferences(group, MODE_PRIVATE).getAll());
+    String device = deviceName();
+    c.settings = PlayerBackup.settings(groups, appVersion(), appVersionCode(), device);
+    try (OutputStream out = getContentResolver().openOutputStream(uri)) {
+      if (out == null) throw new IOException("no stream");
+      PlayerBackup.write(out, c, appVersion(), appVersionCode(), device, System.currentTimeMillis());
+    } catch (IOException | RuntimeException e) {
+      // no half ZIP left behind (the storage full, the provider gone)
+      try { DocumentsContract.deleteDocument(getContentResolver(), uri); } catch (Exception ignored) {}
+      throw e;
+    }
+    String file = displayName(uri);
+    Log.i(TAG, "export: ZIP " + file + ": " + c.cardFiles.size() + " card files, touch layout " + (c.touch != null)
+        + ", instant save " + (c.instant != null) + ", settings " + c.settings.length() + " characters");
+    StringBuilder text = new StringBuilder(String.format(java.util.Locale.ROOT,
+        getResources().getQuantityString(R.plurals.ingame_backup_saved, c.cardFiles.size()), c.cardFiles.size(), file));
+    if (c.instant != null) text.append('\n').append(getString(R.string.ingame_backup_with_instant));
+    if (c.touch != null) text.append('\n').append(getString(R.string.ingame_backup_with_touch));
+    text.append('\n').append(getString(R.string.ingame_backup_with_settings));
+    message(text.toString() + problems);
+  }
+
+  /** The name the chosen file has (the picker may have changed the suggested one). */
+  private String displayName(Uri uri) {
+    try (android.database.Cursor c = getContentResolver().query(uri,
+        new String[] {android.provider.OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+      if (c != null && c.moveToFirst() && c.getString(0) != null) return c.getString(0);
+    } catch (RuntimeException e) {
+      Log.i(TAG, "export: the file's name: " + e);
+    }
+    String last = uri.getLastPathSegment();
+    return last != null ? last.substring(last.lastIndexOf('/') + 1) : "?";
+  }
+
+  /** The device as the ZIP names it ("Retroid Pocket Flip 2"; the graphics settings come back only on the same). */
+  static String deviceName() {
+    String maker = Build.MANUFACTURER == null ? "" : Build.MANUFACTURER.trim();
+    String model = Build.MODEL == null ? "" : Build.MODEL.trim();
+    return model.toLowerCase(java.util.Locale.ROOT).startsWith(maker.toLowerCase(java.util.Locale.ROOT))
+        ? model : (maker + " " + model).trim();
+  }
+
+  /** The app's versionCode (117 for 0.99.15-rc). */
+  private long appVersionCode() {
+    try {
+      android.content.pm.PackageInfo info = getPackageManager().getPackageInfo(getPackageName(), 0);
+      return Build.VERSION.SDK_INT >= 28 ? info.getLongVersionCode() : info.versionCode;
+    } catch (android.content.pm.PackageManager.NameNotFoundException e) {
+      return 0;
+    }
+  }
+
+  private void applyTouch(TouchLayoutFile.Parsed parsed, StringBuilder report) {
+    int[] screen = touchScreen();
+    try {
+      int moved = TouchLayoutFile.apply(touchPrefs(), parsed, screen[0], screen[1], touchSafe(),
+          getResources().getDisplayMetrics().density);
+      if (touchControls != null) touchControls.reloadSaved();
+      Log.i(TAG, "import: touch layout saved, " + moved + " controls moved onto the screen " + screen[0] + "x" + screen[1]);
+      report.append(getString(R.string.ingame_touch_imported)).append('\n');
+      if (moved > 0) {
+        report.append(String.format(java.util.Locale.ROOT,
+            getResources().getQuantityString(R.plurals.ingame_touch_moved, moved), moved)).append('\n');
+      }
+    } catch (IllegalArgumentException e) {
+      Log.i(TAG, "import: touch layout: " + e.getMessage());
+      report.append(getString(R.string.ingame_touch_import_bad, e.getMessage())).append('\n');
+    }
   }
 
   private String reportName() {
@@ -664,7 +1911,52 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
   }
 
   /** The card's file list (without the saves themselves) for the report. */
+  /**
+   * An asset as a file the core reads, in the cache folder (written again only when it changed); null when the app has
+   * none: gx-programs.keys (the shader programs of all devices' error reports, merged by port/tools/gx_program_list.py),
+   * gx-vkpipes.keys (Vulkan's pipelines of the PC's room tours and the reports, port/tools/gx_vkpipe_list.py).
+   */
+  private String assetFile(String name) {
+    byte[] list;
+    try (InputStream in = getAssets().open(name)) {
+      list = CoreLog.readAll(in);
+    } catch (IOException e) {
+      return null;
+    }
+    File file = new File(getCacheDir(), name);
+    try {
+      boolean same = false;
+      if (file.length() == list.length) {
+        try (InputStream in = new java.io.FileInputStream(file)) {
+          same = java.util.Arrays.equals(CoreLog.readAll(in), list);
+        }
+      }
+      if (!same) {
+        try (OutputStream out = new FileOutputStream(file)) {
+          out.write(list);
+        }
+      }
+      return file.getAbsolutePath();
+    } catch (IOException e) {
+      Log.w(TAG, "asset " + name + ": " + e);
+      return null;
+    }
+  }
+
   private String[][] reportExtras() {
+    // the keys of the shader programs this device made (they go into the app's list)
+    try {
+      CoreBridge.writeProgramKeys(new File(CoreLog.folder(this), "program-keys.bin").getAbsolutePath());
+    } catch (UnsatisfiedLinkError e) {
+      Log.w(TAG, "program keys: " + e);
+    }
+    // Vulkan's pipelines of the rooms this device drew (they go into the app's list, port/tools/gx_vkpipe_list.py)
+    File pipes = new File(CoreLog.folder(this), "vk-pipes.bin");
+    try {
+      if (!ShaderCache.writeRoomPipes(ShaderCache.dir(this), pipes)) pipes.delete();
+    } catch (IOException e) {
+      Log.w(TAG, "pipeline lists: " + e);
+    }
     StringBuilder card = new StringBuilder();
     String[] rows = CoreBridge.cardList();
     if (rows == null) {
@@ -674,8 +1966,44 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
       card.append(CoreBridge.cardFreeBlocks()).append(" blocks free\n");
     }
     String map = CoreBridge.addressMap();
-    if (map == null || map.isEmpty()) return new String[][] {{"memory-card.txt", card.toString()}};
-    return new String[][] {{"memory-card.txt", card.toString()}, {"address-map.txt", map}};
+    String controllers = controllerList();
+    String discs = discCheckText();
+    String renderer = rendererText();
+    String shaders = ShaderCache.describe(this);
+    String heat = thermal != null ? thermal.report(SystemClock.elapsedRealtime()) : "not watched\n";
+    if (map == null || map.isEmpty())
+      return new String[][] {{"memory-card.txt", card.toString()}, {"controllers.txt", controllers}, {"disc-check.txt", discs},
+          {"renderer.txt", renderer}, {"shader-cache.txt", shaders}, {"thermal.txt", heat}};
+    return new String[][] {{"memory-card.txt", card.toString()}, {"address-map.txt", map}, {"controllers.txt", controllers},
+        {"disc-check.txt", discs}, {"renderer.txt", renderer}, {"shader-cache.txt", shaders}, {"thermal.txt", heat}};
+  }
+
+  /** The report's disc-check.txt: each imported disc against the original's files, and a file the game could not read. */
+  private String discCheckText() {
+    ImportManager imports = ((Re4Application) getApplication()).imports;
+    StringBuilder t = new StringBuilder();
+    for (int n = 1; n <= 2 && imports.root != null; n++) {
+      File folder = new File(imports.root, "disc" + n);
+      t.append("Disc ").append(n).append(": ");
+      if (!com.ast.re4decomp.disc.DiscInstaller.ready(folder, n)) {
+        t.append("not imported\n");
+        continue;
+      }
+      t.append(ImportManager.releaseName(com.ast.re4decomp.disc.DiscInstaller.release(folder))).append(", ");
+      try (InputStream catalog = imports.roomCatalog(folder)) {
+        RoomFileCheck c = RoomFileCheck.verify(folder, catalog, n);
+        t.append(c.checked).append(c.everyFile ? " files" : " room files").append(" checked (the import's hashes), ");
+        t.append(c.bad.isEmpty() ? "all as on the original disc"
+            : c.bad.size() + " differ (" + c.byFolder() + "): " + String.join(", ", c.bad));
+      } catch (IOException | RuntimeException e) {
+        t.append("no check: ").append(e);
+      }
+      t.append('\n');
+    }
+    String problem = CoreBridge.discProblem();
+    t.append("Read problem: ").append(problem == null || problem.isEmpty() ? "none" : problem.replace('\t', ' ')).append('\n');
+    t.append(discCheck);
+    return t.toString();
   }
 
   /** The error report to an app of the tester's choice (mail, messenger, cloud). */
@@ -706,27 +2034,145 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
   }
 
   private static boolean controller(android.view.InputEvent e) {
+    // a keyboard's events carry the D-pad's source too when it has arrow keys (keyboardDevice)
+    if (keyboardDevice(e.getDevice())) return false;
     return (e.getSource() & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD
         || (e.getSource() & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK
         || (e.getSource() & InputDevice.SOURCE_DPAD) == InputDevice.SOURCE_DPAD;
   }
 
+  /**
+   * The touch controls' B pressed while the benchmark runs: it ends it as a controller's B does (0.99.17, users could
+   * not end it by touch: the touch B went to the game as its button only, never to the benchmark's keys).
+   */
+  private void benchTouch() {
+    final boolean b = input.touchHeld(CoreInput.GC_B);
+    if (b && !touchBenchB && benchFlow != null && benchFlow.running()) {
+      Log.i(TAG, "benchmark: cancelled by the touch controls' B");
+      benchFlow.cancel();
+    }
+    touchBenchB = b;
+  }
+
   private void send() {
     int[] p = input.pad();
     CoreBridge.pad(p[0], p[1], p[2], p[3], p[4], p[5], p[6]);
+    String stick = stickWatch.sample(SystemClock.uptimeMillis(), p[1], p[2]);
+    if (stick != null) Log.i(TAG, stick);
+    // swipe aiming (Touch Aiming: Touch Area): the finger's way since the last event as angles, with the
+    // menu's "Aim speed" and "Invert vertical" as the sticks
+    float[] turn = input.takeAimSwipe();
+    if (turn != null) CoreBridge.aimTurn(turn[0] * aimSpeed, (aimInvert ? -turn[1] : turn[1]) * aimSpeed);
+    // "Turn Leon with mouse / look area": the look zone's movement sideways, with the menu's "Aim speed"
+    float body = input.takeBodyTurn();
+    if (body != 0) CoreBridge.bodyTurn(body * aimSpeed);
   }
 
-  /** Once per device: what it reports (name, sources, axes), for the device test's log. */
-  private void noteDevice(InputDevice d) {
-    if (d == null || !seenDevices.add(d.getId())) return;
+  /** The keys the game maps or the app uses: which of them a device reports. */
+  private static final int[] WATCHED_KEYS = {
+      KeyEvent.KEYCODE_BUTTON_A, KeyEvent.KEYCODE_BUTTON_B, KeyEvent.KEYCODE_BUTTON_X, KeyEvent.KEYCODE_BUTTON_Y,
+      KeyEvent.KEYCODE_BUTTON_L1, KeyEvent.KEYCODE_BUTTON_R1, KeyEvent.KEYCODE_BUTTON_L2, KeyEvent.KEYCODE_BUTTON_R2,
+      KeyEvent.KEYCODE_BUTTON_THUMBL, KeyEvent.KEYCODE_BUTTON_THUMBR, KeyEvent.KEYCODE_BUTTON_START,
+      KeyEvent.KEYCODE_BUTTON_SELECT, KeyEvent.KEYCODE_BUTTON_MODE, KeyEvent.KEYCODE_BUTTON_C,
+      KeyEvent.KEYCODE_BUTTON_Z, KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN,
+      KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT};
+
+  /** One line about a device: name, ids, sources, axes and which of the watched keys it has. */
+  private static String describeDevice(InputDevice d) {
     StringBuilder axes = new StringBuilder();
     for (InputDevice.MotionRange r : d.getMotionRanges()) {
       axes.append(' ').append(MotionEvent.axisToString(r.getAxis()))
           .append(String.format(Locale.ROOT, "(%.2f..%.2f flat %.3f)", r.getMin(), r.getMax(), r.getFlat()));
     }
-    Log.i(TAG, String.format(Locale.ROOT, "device %d \"%s\" vendor %04x product %04x sources 0x%x%s axes:%s",
-        d.getId(), d.getName(), d.getVendorId(), d.getProductId(), d.getSources(),
-        d.isVirtual() ? " virtual" : "", axes.length() == 0 ? " none" : axes.toString()));
+    StringBuilder keys = new StringBuilder();
+    boolean[] has = d.hasKeys(WATCHED_KEYS);
+    for (int i = 0; i < WATCHED_KEYS.length; i++) {
+      if (has[i]) keys.append(' ').append(KeyEvent.keyCodeToString(WATCHED_KEYS[i]).replace("KEYCODE_", ""));
+    }
+    return String.format(Locale.ROOT, "device %d \"%s\" vendor %04x product %04x descriptor %s sources 0x%x%s%s keys:%s axes:%s",
+        d.getId(), d.getName(), d.getVendorId(), d.getProductId(), d.getDescriptor(), d.getSources(),
+        d.isVirtual() ? " virtual" : "", Build.VERSION.SDK_INT < 29 ? "" : d.isExternal() ? " external" : " built-in",
+        keys.length() == 0 ? " none" : keys.toString(), axes.length() == 0 ? " none" : axes.toString());
+  }
+
+  /** Once per device: what it reports (name, sources, axes), for the device test's log. */
+  /** Every 30 seconds with controller input: its delay from Android to the app (InputDelay) in the error log. */
+  private void noteInputDelay(InputDevice d) {
+    String line = inputDelay.due(SystemClock.uptimeMillis(), d == null ? "?" : "\"" + d.getName() + "\""
+        + (Build.VERSION.SDK_INT >= 30 ? ", motion unbuffered" : ""));
+    if (line != null) Log.i(TAG, line);
+  }
+
+  private void noteDevice(InputDevice d) {
+    if (d == null || !seenDevices.add(d.getId())) return;
+    Log.i(TAG, describeDevice(d));
+  }
+
+  /**
+   * A real keyboard (letters), not a controller that also reports keys (the Retroid's built-in one, which is a
+   * gamepad and a joystick). Android gives every keyboard with arrow keys the D-pad's source as well (sources
+   * 0x301): that alone does not make it a controller (tester report 05.11.2026, OnePlus 9R: a keyboard was taken
+   * for a controller, its keys did nothing in the game and in the button mapping).
+   */
+  static boolean keyboardDevice(InputDevice d) {
+    if (d == null || d.isVirtual()) return false;
+    return keyboardSources(d.getSources(), d.getKeyboardType());
+  }
+
+  /**
+   * keyboardDevice by the device's sources and keyboard type (InputDevice), for the tests. A device with letters
+   * (KEYBOARD_TYPE_ALPHABETIC) and no stick is a keyboard, even when Android also gives it the gamepad's source
+   * (some Bluetooth keyboards declare a few gamepad buttons in their HID description; the tester's keyboard and
+   * mouse were Bluetooth, 05.11.2026); its gamepad buttons, if any, still go the controller's way (dispatchKeyEvent
+   * checks KeyEvent.isGamepadButton first). Controllers with sticks (the Retroid, Xbox and PlayStation pads) and
+   * those without letters stay controllers.
+   */
+  static boolean keyboardSources(int s, int keyboardType) {
+    if ((s & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK) return false;
+    return (s & InputDevice.SOURCE_KEYBOARD) == InputDevice.SOURCE_KEYBOARD
+        && keyboardType == InputDevice.KEYBOARD_TYPE_ALPHABETIC;
+  }
+
+  /** Game controllers and gamepad-like devices (a remote's D-pad too, not a keyboard's arrow keys), for the
+   *  connect lines and controllers.txt. */
+  private static boolean gameDevice(InputDevice d) {
+    if (d == null || d.isVirtual()) return false;
+    return gameSources(d.getSources(), d.getKeyboardType());
+  }
+
+  /** gameDevice by the device's sources and keyboard type (InputDevice), for the tests. */
+  static boolean gameSources(int s, int keyboardType) {
+    if (keyboardSources(s, keyboardType)) return false;
+    return (s & InputDevice.SOURCE_GAMEPAD) == InputDevice.SOURCE_GAMEPAD
+        || (s & InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK
+        || (s & InputDevice.SOURCE_DPAD) == InputDevice.SOURCE_DPAD;
+  }
+
+  /** A device that is plugged in or changed: described at once, not only at its first mapped key. */
+  private void noteConnected(int id) {
+    InputDevice d = InputDevice.getDevice(id);
+    if (gameDevice(d) && controllerLog.firstDevice(id)) Log.i(TAG, "connected: " + describeDevice(d));
+    // keyboards and mice too (a Bluetooth keyboard's report, 05.11.2026: nothing of it was in the log)
+    else if ((keyboardDevice(d) || mouseDevice(d)) && controllerLog.firstDevice(id)) {
+      Log.i(TAG, "connected: " + describeDevice(d) + (keyboardDevice(d) ? " (keyboard)" : "") + (mouseDevice(d) ? " (mouse)" : ""));
+    }
+  }
+
+  /** controllers.txt of the error report: every game controller connected now, then keyboards and mice (since
+   *  0.98.4: a report about a keyboard listed nothing of it). */
+  private String controllerList() {
+    StringBuilder out = new StringBuilder(), other = new StringBuilder();
+    for (int id : InputDevice.getDeviceIds()) {
+      InputDevice d = InputDevice.getDevice(id);
+      if (gameDevice(d)) out.append(describeDevice(d)).append(layoutLine(d)).append('\n');
+      else if (keyboardDevice(d) || mouseDevice(d)) {
+        other.append(describeDevice(d)).append(keyboardDevice(d) ? " (keyboard)" : "").append(mouseDevice(d) ? " (mouse)" : "")
+            .append('\n');
+      }
+    }
+    if (out.length() == 0) out.append("(no game controller connected)\n");
+    out.append(other.length() == 0 ? "(no keyboard or mouse connected)\n" : "keyboards and mice:\n" + other);
+    return out.toString();
   }
 
   @Override
@@ -734,7 +2180,20 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
     int code = e.getKeyCode();
     boolean down = e.getAction() == KeyEvent.ACTION_DOWN;
     boolean first = down && e.getRepeatCount() == 0;
-    int function = CoreInput.appFunction(code);
+    // the benchmark: the keys belong to it; the game's B (through the controller's or the keyboard's mapping), Back or
+    // Esc cancel it (BenchmarkFlow.cancels; the touch controls' B: benchTouch)
+    if (benchFlow != null && benchFlow.running()) {
+      if (first) {
+        final boolean keys = !controller(e) && !KeyEvent.isGamepadButton(code) && keyboardDevice(e.getDevice());
+        if (BenchmarkFlow.cancels(code, keys ? input.keyboardButton(code) : input.gcButton(code))) {
+          Log.i(TAG, "benchmark: cancelled by " + KeyEvent.keyCodeToString(code) + (keys ? " (keyboard)" : ""));
+          benchFlow.cancel();
+        }
+      }
+      return true;
+    }
+    boolean keyboard = !controller(e) && !KeyEvent.isGamepadButton(code) && keyboardDevice(e.getDevice());
+    int function = input.appFunctionOf(code, keyboard);
     if (function != CoreInput.APP_NONE && first) {
       String what = function == CoreInput.APP_MENU ? "menu" : tools ? "graphics capture" : "nothing (tools off)";
       Log.i(TAG, "key " + KeyEvent.keyCodeToString(code) + " (" + code + ") -> app " + what);
@@ -743,7 +2202,7 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
       case CoreInput.APP_MENU:
         // pressed: the menu when let go; held for a second: the game's debug menu
         if (first) {
-          if (controller(e)) touchControls.controllerUsed();
+          if (controller(e) || keyboard) touchControls.controllerUsed();
           select(true);
         } else if (e.getAction() == KeyEvent.ACTION_UP) {
           select(false);
@@ -752,21 +2211,38 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
       case CoreInput.APP_GX_DUMP:
         // R3 (right stick pressed): the graphics data of the next pictures for the
         // diagnosis in the cloud (files/gx-dumps, test-core-app.ps1 / pull-gx-dumps.ps1 fetch them)
-        if (first && tools) {
-          File dir = getExternalFilesDir(null);
-          if (dir != null) {
-            CoreBridge.gxDump(new File(dir, "gx-dumps").getAbsolutePath());
-            Toast.makeText(this, R.string.ingame_capture_saved, Toast.LENGTH_SHORT).show();
-          }
-        }
+        if (first) capture();
         return true;
       default:
         break;
+    }
+    // a keyboard (the button mapping, 29.10.2026): its mapping's keys and the fixed ones go to the game;
+    // Esc always (Android would make it "back" and ask to quit), the rest to Android
+    if (keyboard) {
+      if (e.getAction() != KeyEvent.ACTION_DOWN && e.getAction() != KeyEvent.ACTION_UP) return true;
+      if (e.getRepeatCount() > 0) return true;
+      boolean taken = input.keyboardKey(e.getDeviceId(), code, down);
+      if (taken || code == KeyEvent.KEYCODE_ESCAPE) {
+        if (down) {
+          touchControls.controllerUsed();
+          noteDevice(e.getDevice());
+          if (controllerLog.firstKey(e.getDeviceId(), code)) {
+            Log.i(TAG, "keyboard " + KeyEvent.keyCodeToString(code) + " (" + code + ", device " + e.getDeviceId()
+                + ") -> GC " + CoreInput.names(input.keyboardButton(code)) + (input.menu() ? " (a game menu)" : ""));
+          }
+        }
+        send();
+        return true;
+      }
+      return super.dispatchKeyEvent(e);
     }
     if (controller(e) || KeyEvent.isGamepadButton(code)) {
       if (e.getAction() != KeyEvent.ACTION_DOWN && e.getAction() != KeyEvent.ACTION_UP) return true;
       if (e.getRepeatCount() > 0) return true;  // held: nothing changes
       if (input.key(e.getDeviceId(), code, down)) {
+        if (down) padUsed(e.getDevice());
+        inputDelay.button(e.getEventTime(), SystemClock.uptimeMillis());
+        noteInputDelay(e.getDevice());
         if (down) {
           touchControls.controllerUsed();
           noteDevice(e.getDevice());
@@ -783,33 +2259,115 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
         return true;
       }
     }
+    // a controller's button without a function (L1, L3, R3 without an extra key): kept from Android,
+    // which would make B "back" and ask to quit the game (device test 27.10.2026)
+    boolean dpad = code == KeyEvent.KEYCODE_DPAD_UP || code == KeyEvent.KEYCODE_DPAD_DOWN
+        || code == KeyEvent.KEYCODE_DPAD_LEFT || code == KeyEvent.KEYCODE_DPAD_RIGHT;
+    if (controller(e) && (KeyEvent.isGamepadButton(code) || dpad)) {
+      if (down && controllerLog.firstKey(e.getDeviceId(), code)) {
+        Log.i(TAG, "key " + KeyEvent.keyCodeToString(code) + " (" + code + ", device " + e.getDeviceId()
+            + ") -> no function, not passed on");
+      }
+      return true;
+    }
+    // a key nothing here handles (a rare controller's extra buttons): named once per device and code
+    if (down && controller(e) && controllerLog.firstKey(e.getDeviceId(), code)) {
+      InputDevice d = e.getDevice();
+      Log.i(TAG, "key " + KeyEvent.keyCodeToString(code) + " (" + code + ", scan " + e.getScanCode() + ", device "
+          + e.getDeviceId() + (d == null ? "" : " \"" + d.getName() + "\"") + ") -> not mapped, passed on to Android");
+    }
     return super.dispatchKeyEvent(e);
+  }
+
+  /** An axis the game does not read moved past half its range: named once per device. */
+  private void noteUnreadAxes(MotionEvent e, InputDevice d) {
+    if (d == null) return;
+    for (InputDevice.MotionRange r : d.getMotionRanges()) {
+      int a = r.getAxis();
+      if (ControllerLog.readAxis(a) || r.getRange() <= 0) continue;
+      float v = e.getAxisValue(a);
+      if (Math.abs(2 * (v - r.getMin()) / r.getRange() - 1) > 0.5f && controllerLog.firstAxis(e.getDeviceId(), a)) {
+        Log.i(TAG, String.format(Locale.ROOT, "axis %s moved to %.2f on device %d \"%s\" -> not read by the game",
+            MotionEvent.axisToString(a), v, e.getDeviceId(), d.getName()));
+      }
+    }
   }
 
   /** An axis of `e` in -1..1 (sticks, hat) or 0..1 (triggers); 0 when the device lacks it. */
   private static float axis(MotionEvent e, InputDevice d, int a, boolean trigger) {
     InputDevice.MotionRange range = d == null ? null : d.getMotionRange(a, e.getSource());
     if (range == null || range.getRange() <= 0) return 0;
-    float v = e.getAxisValue(a);
-    if (Float.isNaN(v) || Float.isInfinite(v)) return 0;
-    return trigger ? (v - range.getMin()) / range.getRange()
-        : 2 * (v - range.getMin()) / range.getRange() - 1;
+    return ControllerAxes.normalise(e.getAxisValue(a), range.getMin(), range.getMax(), trigger);
+  }
+
+  /** A device's axes for the source `source` and, while `e` is set, their values in it (ControllerAxes). */
+  static final class EventAxes implements ControllerAxes.Axes {
+    private MotionEvent e;
+    private InputDevice d;
+    private int source;
+
+    EventAxes set(MotionEvent e, InputDevice d, int source) {
+      this.e = e;
+      this.d = d;
+      this.source = source;
+      return this;
+    }
+
+    private InputDevice.MotionRange range(int a) { return d == null ? null : d.getMotionRange(a, source); }
+    @Override public boolean has(int a) { InputDevice.MotionRange r = range(a); return r != null && r.getRange() > 0; }
+    @Override public float min(int a) { InputDevice.MotionRange r = range(a); return r == null ? 0 : r.getMin(); }
+    @Override public float max(int a) { InputDevice.MotionRange r = range(a); return r == null ? 0 : r.getMax(); }
+    @Override public float flat(int a) { InputDevice.MotionRange r = range(a); return r == null ? 0 : r.getFlat(); }
+    @Override public float value(int a) { return e == null ? 0 : e.getAxisValue(a); }
+  }
+
+  private final EventAxes eventAxes = new EventAxes();
+  /** Each controller's right stick and triggers (ControllerAxes), made at its first stick event. */
+  private final android.util.SparseArray<ControllerAxes> padLayouts = new android.util.SparseArray<>();
+  private final float[] padRight = new float[4];
+
+  /** The controller's layout, named in the log when it is made (0.99.13: which axes are its stick and triggers). */
+  private ControllerAxes padLayout(InputDevice d, EventAxes a) {
+    if (d == null) return ControllerAxes.of(null);
+    ControllerAxes layout = padLayouts.get(d.getId());
+    if (layout == null) {
+      layout = ControllerAxes.of(a);
+      padLayouts.put(d.getId(), layout);
+      Log.i(TAG, "controller " + d.getId() + " \"" + d.getName() + "\": " + layout.describe());
+    }
+    return layout;
+  }
+
+  /** For controllers.txt: the layout a controller gets (or got) for its stick events. */
+  private static String layoutLine(InputDevice d) {
+    if ((d.getSources() & InputDevice.SOURCE_JOYSTICK) != InputDevice.SOURCE_JOYSTICK) return "";
+    return " layout: " + ControllerAxes.of(new EventAxes().set(null, d, InputDevice.SOURCE_JOYSTICK)).describe();
   }
 
   @Override
   public boolean onGenericMotionEvent(MotionEvent e) {
+    // the mouse wheel while the game has the mouse but has not captured it (Android 7, before the first click)
+    if (e.getActionMasked() == MotionEvent.ACTION_SCROLL && e.isFromSource(InputDevice.SOURCE_CLASS_POINTER)
+        && mouseWanted()) {
+      wheel(e);
+      return true;
+    }
     if (e.getAction() == MotionEvent.ACTION_MOVE && controller(e)) {
       InputDevice d = e.getDevice();
       noteDevice(d);
-      // the right stick: Z/RZ on most Android controllers, RX/RY on others
-      boolean zr = d != null && d.getMotionRange(MotionEvent.AXIS_Z, e.getSource()) != null
-          && d.getMotionRange(MotionEvent.AXIS_RZ, e.getSource()) != null;
+      padUsed(d);
+      // the right stick and the triggers: Z/RZ and LTRIGGER/RTRIGGER on the controllers Android knows, RX/RY and
+      // Z/RZ on those it leaves in the driver's order (a wired Xbox pad without its key layout file; ControllerAxes)
+      eventAxes.set(e, d, e.getSource());
+      padLayout(d, eventAxes).read(eventAxes, padRight);
+      eventAxes.set(null, null, 0);
       float lx = axis(e, d, MotionEvent.AXIS_X, false), ly = axis(e, d, MotionEvent.AXIS_Y, false);
-      float rx = axis(e, d, zr ? MotionEvent.AXIS_Z : MotionEvent.AXIS_RX, false);
-      float ry = axis(e, d, zr ? MotionEvent.AXIS_RZ : MotionEvent.AXIS_RY, false);
-      float l = Math.max(axis(e, d, MotionEvent.AXIS_LTRIGGER, true), axis(e, d, MotionEvent.AXIS_BRAKE, true));
-      float r = Math.max(axis(e, d, MotionEvent.AXIS_RTRIGGER, true), axis(e, d, MotionEvent.AXIS_GAS, true));
+      float rx = padRight[0], ry = padRight[1], l = padRight[2], r = padRight[3];
       float hx = axis(e, d, MotionEvent.AXIS_HAT_X, false), hy = axis(e, d, MotionEvent.AXIS_HAT_Y, false);
+      noteUnreadAxes(e, d);
+      inputDelay.stick(e.getEventTime(), e.getHistorySize() > 0 ? e.getHistoricalEventTime(0) : e.getEventTime(),
+          SystemClock.uptimeMillis());
+      noteInputDelay(d);
       input.motion(e.getDeviceId(), lx, ly, rx, ry, l, r, hx, hy);
       // a stick, trigger or hat moved on purpose: the touch controls go again (TouchShowRule)
       if (TouchShowRule.moved(lx, ly, rx, ry, l, r, hx, hy)) touchControls.controllerUsed();
@@ -825,6 +2383,12 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
    */
   @Override
   public boolean dispatchTouchEvent(MotionEvent e) {
+    // a mouse on the picture while the game is in front: it is captured (its clicks are no taps)
+    if (Build.VERSION.SDK_INT >= 26 && e.isFromSource(InputDevice.SOURCE_MOUSE) && mouseWanted()) {
+      if (e.getActionMasked() == MotionEvent.ACTION_DOWN) updateMouseCapture();
+      return true;
+    }
+    watchTap(e);
     if (touchControls == null) return super.dispatchTouchEvent(e);
     touchControls.before(e);
     boolean taken = super.dispatchTouchEvent(e);
@@ -832,22 +2396,253 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
     return taken;
   }
 
-  @Override public void onInputDeviceAdded(int id) { touchControls.update(); }
+  // A tap on the picture beside the touch controls (one finger, short, hardly moved; wish of the
+  // project owner, 22.10.2026: the inventory by touch) goes to the core, which uses it in the
+  // attache case (runtime/menu_touch.cpp) and ignores it elsewhere; a swipe (one finger, mostly
+  // sideways, at least an eighth of the picture's width, within 700 ms) changes the sub screen's
+  // tab (wish of the project owner after the first device test). A swipe in any direction, at
+  // least a sixth of the picture's shorter side, draws the knife and slashes while playing, higher
+  // or lower by its slope (runtime/knife_swipe.cpp; wish of the project owner, 22.10.2026; the
+  // menu's switch "Knife by Swipe"); the core ignores it in sub screens. Dragging the map with a
+  // finger was taken out again (device test 22.10.2026 21:22: it kept swipes from leaving the map).
+  private static final long TAP_MS = 500, SWIPE_MS = 700;
+  private boolean knifeSwipe = true;
+  private int tapFinger = -1;
+  private boolean tapMoved;
+  private float tapX, tapY;
+  private long tapTime;
+  private final int[] surfaceAt = new int[2];
+
+  private void watchTap(MotionEvent e) {
+    int i = e.getActionIndex();
+    switch (e.getActionMasked()) {
+      case MotionEvent.ACTION_DOWN: {
+        boolean control = touchControls != null && touchControls.onControl(e.getX(), e.getY());
+        tapFinger = control ? -1 : e.getPointerId(0);
+        tapMoved = false;
+        tapX = e.getX();
+        tapY = e.getY();
+        tapTime = e.getEventTime();
+        // a quick-time prompt's press as the finger touches down (0.99.15: until then at its lift, the tap's length
+        // late; the owner, Professional: "with touch not to be done")
+        if (!control && surface != null) CoreBridge.touchDown();
+        break;
+      }
+      case MotionEvent.ACTION_POINTER_DOWN:
+        tapFinger = -1;  // a second finger: no tap, no swipe
+        // ... but a press for a quick-time prompt (two thumbs in turn mash twice as fast)
+        if (surface != null && (touchControls == null || !touchControls.onControl(e.getX(i), e.getY(i)))) {
+          CoreBridge.touchDown();
+        }
+        break;
+      case MotionEvent.ACTION_MOVE: {
+        int k = tapFinger >= 0 ? e.findPointerIndex(tapFinger) : -1;
+        float slop = 2 * ViewConfiguration.get(this).getScaledTouchSlop();
+        if (k >= 0 && Math.hypot(e.getX(k) - tapX, e.getY(k) - tapY) > slop) tapMoved = true;
+        break;
+      }
+      case MotionEvent.ACTION_UP:
+        if (tapFinger >= 0 && tapFinger == e.getPointerId(i) && surface != null) {
+          long time = e.getEventTime() - tapTime;
+          float dx = e.getX(i) - tapX, dy = e.getY(i) - tapY;
+          if (!tapMoved && time <= TAP_MS) {
+            surface.getLocationInWindow(surfaceAt);
+            CoreBridge.tap(e.getX(i) - surfaceAt[0], e.getY(i) - surfaceAt[1]);
+          } else if (time <= SWIPE_MS) {
+            if (Math.abs(dx) >= surface.getWidth() / 8f && Math.abs(dx) >= 2 * Math.abs(dy)) {
+              CoreBridge.swipe(dx < 0 ? 1 : -1);
+            }
+            float length = (float) Math.hypot(dx, dy);
+            if (knifeSwipe && length >= Math.min(surface.getWidth(), surface.getHeight()) / 6f) {
+              CoreBridge.slash(-dy / length);
+            }
+          }
+        }
+        tapFinger = -1;
+        break;
+      case MotionEvent.ACTION_CANCEL:
+        tapFinger = -1;
+        break;
+      default:
+        break;
+    }
+  }
+
+  @Override public void onInputDeviceAdded(int id) { noteConnected(id); touchControls.update(); updateMouseCapture(); }
   @Override public void onInputDeviceChanged(int id) {
+    if (id == lastPad) chooseRumble("controller changed");
     input.remove(id);
     seenDevices.remove(id);
+    padLayouts.remove(id);
+    controllerLog.forget(id);
+    noteConnected(id);
     send();
     touchControls.update();
   }
   @Override public void onInputDeviceRemoved(int id) {
+    if (id == lastPad) {
+      // its motors stop with it; the device's vibrator until another controller is used
+      lastPad = -1;
+      chooseRumble("controller removed");
+    }
+    padLayouts.remove(id);
+    controllerLog.forget(id);
     input.remove(id);
     send();
     touchControls.update();
   }
 
+  // ---- the benchmark and the performance profiles (0.99.10, BenchmarkFlow, PerfProfile; the measurement is in
+  // core_mode.cpp) ---------------------------------------------------------------------------------------------------
+  private TextView benchView;
+  private BenchmarkFlow benchFlow;
+  private PerfProfile.Device perfDevice;
+
+  /** Before the first renderer: a fresh install gets the first start's benchmark, an update the menu's question once;
+   *  either starts with Custom as the active profile (the settings as they are). */
+  private void perfFirstRun(SharedPreferences g) {
+    if (g.contains(PerfProfile.FIRST)) {
+      // 0.99.12: a benchmark of before (no processor share) is made again once, as on the first start; 0.99.14 the same
+      // for one without the GPU's reserve
+      if (PerfProfile.scheduleRedo(g)) {
+        Log.i(TAG, "performance profiles: a benchmark of before 0.99.14 (no reserve for the GPU): measured again once "
+            + "the title's menu waits");
+      }
+      return;
+    }
+    String[] mine = {"scaleHalves", "scale", "aspect", "samples", "anisotropy", "smooth60", "fxaa", "fastCores",
+        "weatherEffects", "specialEffects", "particleEffects", "shadowsLight", CoreMenu.FRAME_SKIP, "frameskip",
+        CoreMenu.DYN_CAP_30, CoreMenu.DOF_LEVEL, "dof", "minimap", "fps"};
+    boolean fresh = true;
+    for (String k : mine) if (g.contains(k)) { fresh = false; break; }
+    g.edit().putInt(PerfProfile.FIRST, fresh ? PerfProfile.FIRST_PENDING : PerfProfile.FIRST_ASK)
+        .putInt(PerfProfile.ACTIVE, PerfProfile.CUSTOM).apply();
+    Log.i(TAG, "performance profiles: " + (fresh ? "a new installation, the benchmark comes once the title's menu waits"
+        : "an update, the menu asks once"));
+  }
+
+  /** What the app knows of this device (the renderer's text once it is there). */
+  private PerfProfile.Device perfDevice() {
+    String gpu = CoreBridge.rendererInfo();
+    if (perfDevice != null && (gpu == null || gpu.isEmpty() || gpu.equals(perfDevice.gpu))) return perfDevice;
+    int[] cpu = PerfProfile.cpu();
+    long ram = 0;
+    android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
+    if (am != null) {
+      android.app.ActivityManager.MemoryInfo mi = new android.app.ActivityManager.MemoryInfo();
+      am.getMemoryInfo(mi);
+      ram = mi.totalMem / (1024 * 1024);
+    }
+    int[] info = CoreBridge.graphicsInfo();
+    // the screen's rows of a 16:9 picture (PerfProfile.screenLevel: MSAA only beyond them); the game's surface, else
+    // the display
+    int w = surface != null ? surface.getWidth() : 0, h = surface != null ? surface.getHeight() : 0;
+    if (w <= 0 || h <= 0) {
+      android.util.DisplayMetrics m = getResources().getDisplayMetrics();
+      w = m.widthPixels; h = m.heightPixels;
+    }
+    int rows = Math.min(Math.min(w, h), Math.max(w, h) * 9 / 16);
+    perfDevice = new PerfProfile.Device(gpu, cpu[0], cpu[1], cpu[2], (int) ram, menuHost.displayHz(),
+        info != null && info.length > 0 ? info[0] : 1, info != null && info.length > 1 ? info[1] : 1, rows);
+    return perfDevice;
+  }
+
+  /** The menu's options from the preferences to the core (a profile chosen, a benchmark's end). */
+  private void applyOptions() {
+    SharedPreferences g = getSharedPreferences(GRAPHICS_PREFS, MODE_PRIVATE);
+    int skip = CoreMenu.frameSkipMode(g);
+    if (g.getBoolean("smooth60", false)) skip = 0;
+    applyGraphics();
+    CoreBridge.setDof(CoreMenu.dofLevel(g));
+    CoreBridge.setSmooth(g.getBoolean("smooth60", false));
+    CoreBridge.setFrameSkip(skip == 1);
+    CoreBridge.setCpuSkip(skip == 2);
+    CoreBridge.setFxaa(g.getBoolean("fxaa", false));
+    CoreBridge.setSharpen(CoreMenu.sharpenLevel(g));
+    CoreBridge.setSharperText(CoreMenu.sharperText(g));
+    CoreBridge.setCrt(CoreMenu.crtLevel(g));
+    CoreBridge.setBloom(CoreBridge.bloomSent(g));
+    CoreBridge.setColour(CoreMenu.colourMode(g), CoreMenu.colourLevel(g));
+    CoreBridge.setTvFilter(g.getBoolean("tvFilter", false));
+    CoreBridge.setPsx(g.getBoolean("psx", false));
+    CoreBridge.setFlares(CoreBridge.flareMode(g));
+    CoreBridge.setViewDistance(CoreBridge.VIEW_PERCENT[CoreBridge.viewDistance(g)]);
+    CoreBridge.setDynamicCaps(g.getInt(CoreMenu.DYN_CAP_30, 0), g.getInt(CoreMenu.DYN_CAP_60, 0));
+    CoreBridge.setFastCores(g.getInt("fastCores", 0) == 1);
+    CoreBridge.setPotato(CoreBridge.potatoSent(g));
+  }
+
+  private final BenchmarkFlow.Host benchHost = new BenchmarkFlow.Host() {
+    @Override public Activity activity() { return CoreActivity.this; }
+    @Override public SharedPreferences graphics() { return getSharedPreferences(GRAPHICS_PREFS, MODE_PRIVATE); }
+    @Override public void applyOptions() { CoreActivity.this.applyOptions(); }
+    @Override public void applyClean() {
+      // benchmark 1: the player's look settings as they play (depth of field, lens flares, sharpening, the filters:
+      // no profile changes them; the project owner's Retroid test 11.11.2026: measured without them, the levels were
+      // too high for his game), the profile's settings at their base (no anti-aliasing or texture filter, no frame
+      // skip, Potato off, the performance cores as every profile has them), the picture format "Native"; the
+      // benchmark sets the level and 60 FPS itself
+      SharedPreferences g = graphics();
+      CoreActivity.this.applyOptions();
+      CoreBridge.setGraphics(CoreMenu.scaleHalves(g), 1, 1, 5);
+      CoreBridge.setFxaa(false);
+      CoreBridge.setFrameSkip(false);
+      CoreBridge.setCpuSkip(false);
+      CoreBridge.setFastCores(true);
+      CoreBridge.setPotato(0);
+      CoreBridge.setViewDistance(CoreBridge.VIEW_PERCENT[0]);
+    }
+    @Override public void applyValues(int[] v) {
+      SharedPreferences g = graphics();
+      CoreActivity.this.applyOptions();
+      CoreBridge.setGraphics(v[PerfProfile.SCALE], v[PerfProfile.SAMPLES], v[PerfProfile.ANISO], g.getInt("aspect", 0));
+      CoreBridge.setFxaa(v[PerfProfile.FXAA] != 0);
+      CoreBridge.setSmooth(v[PerfProfile.SMOOTH] != 0);
+      CoreBridge.setFrameSkip(v[PerfProfile.SMOOTH] == 0 && v[PerfProfile.SKIP] == 1);
+      CoreBridge.setCpuSkip(v[PerfProfile.SMOOTH] == 0 && v[PerfProfile.SKIP] == 2);
+      CoreBridge.setFastCores(v[PerfProfile.CORES] == 1);
+      CoreBridge.setPotato((v[PerfProfile.WEATHER] != 0 ? 0 : 1) | (v[PerfProfile.SPECIAL] != 0 ? 0 : 2)
+          | (v[PerfProfile.PARTICLES] << 2) | (v[PerfProfile.SHADOWS] != 0 ? 0 : 16));
+      CoreBridge.setViewDistance(CoreBridge.VIEW_PERCENT[CoreBridge.viewLevel(v[PerfProfile.VIEW])]);
+    }
+    @Override public void progress(String text) {
+      benchView.setText(text != null ? text : "");
+      benchView.setVisibility(text != null ? View.VISIBLE : View.GONE);
+    }
+    // the speaker silent while it runs (the game's sound goes on inside: an honest measurement)
+    @Override public void mute(boolean on) { audio.setMuted(on); }
+    @Override public void hold(boolean on) {
+      // a benchmark popup holds the game like the menu: no hang report while it is open (the Retroid test,
+      // 11.11.2026: "hang: no game frame for 8 s" at popups 2 and 3)
+      benchHeld = on;
+      if (on) {
+        releaseAll();
+        CoreBridge.pause(true, 800);
+        audio.stop();
+        stopVibrator();
+      } else if (resumed && menu == null && !touchEditing) {
+        CoreBridge.pause(false, 0);
+        audio.start();
+        surface.requestFocus();
+      }
+    }
+    @Override public PerfProfile.Device device() { return perfDevice(); }
+  };
+
+  /** Twice a second (tick): the very first start's benchmark once the title's menu waits (core: cheat 24). */
+  private void checkFirstBenchmark() {
+    if (benchFlow == null || !benchFlow.firstDue() || menu != null || touchEditing || !resumed || !menuSupported) return;
+    if (CoreBridge.cheatAction(24) == 1) {
+      Log.i(TAG, "performance profiles: the title's menu waits, the first start's benchmark is offered");
+      benchFlow.offerFirst();
+    }
+  }
+
   /** Nothing held while the game is not in front (no stuck keys after a dialog or the home screen). */
   private void releaseAll() {
     input.clear();
+    mouseButtons = 0;
+    main.removeCallbacks(mouseRest);
     if (touchControls != null) touchControls.reset();
     send();
   }
@@ -855,7 +2650,157 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
   @Override
   public void onWindowFocusChanged(boolean focus) {
     super.onWindowFocusChanged(focus);
+    Log.i(TAG, "window focus: " + (focus ? "on" : "off"));
     if (!focus) releaseAll();
+    else main.post(this::updateMouseCapture);
+    // a car's panel (climate, notifications) closed again: its bars hidden again where the car allows it
+    if (focus && CarDisplay.is(this)) {
+      hideSystemUi();
+      CarDisplay.refocus(this, getWindow());
+    }
+  }
+
+  // ---- aiming by touch and controllers (the menu's "Invert vertical", "Aim speed") ----
+
+  /**
+   * A change of "reverse" in the game's own options (Controller) is the menu's "Invert vertical" too (patch 0188,
+   * user report 03.11.2026: the app's switch set it back at every start): kept when the menu opens and the app
+   * leaves the front.
+   */
+  private void keepGameAimInvert() {
+    if (!menuSupported) return;
+    int fromGame = CoreBridge.aimFromGame();
+    if (fromGame < 0 || (fromGame == 1) == aimInvert) return;
+    aimInvert = fromGame == 1;
+    getSharedPreferences(INPUT_PREFS, MODE_PRIVATE).edit().putBoolean(AIM_INVERT_V, aimInvert).apply();
+    Log.i(TAG, "aim: vertical aiming " + (aimInvert ? "inverted" : "normal") + " from the game's own options, kept");
+  }
+  private boolean aimInvert, autoAim, alwaysRun;
+  private float aimSpeed = 1f;
+
+  /** The stored aim speed on the slider's steps (1 for anything else). */
+  static float clampAimSpeed(float v) {
+    if (Float.isNaN(v) || v < AIM_SPEED_MIN || v > AIM_SPEED_MAX) return 1f;
+    return Math.round(v / AIM_SPEED_STEP) * AIM_SPEED_STEP;
+  }
+
+  // ---- the mouse ----
+  private float mouseSensitivity = 1f;
+  private int mouseButtons;  // the captured mouse's buttons held (MotionEvent.BUTTON_*)
+  private int mouseCaptures;
+  private final Runnable mouseRest = () -> {
+    input.mouseLook(0, 0);
+    send();
+  };
+
+  static float clampMouse(float v) {
+    return Float.isNaN(v) ? 1f : Math.max(MOUSE_MIN, Math.min(MOUSE_MAX, v));
+  }
+
+  /** A real mouse is connected (not a touchpad of the screen). */
+  static boolean mouseDevice(InputDevice d) {
+    return d != null && !d.isVirtual() && (d.getSources() & InputDevice.SOURCE_MOUSE) == InputDevice.SOURCE_MOUSE;
+  }
+
+  private boolean mouseConnected() {
+    for (int id : InputDevice.getDeviceIds()) if (mouseDevice(InputDevice.getDevice(id))) return true;
+    return false;
+  }
+
+  /** The game in front, no menu, no touch editor, a mouse there: the mouse belongs to the game. */
+  private boolean mouseWanted() {
+    return resumed && hasWindowFocus() && menu == null && !touchEditing && mouseConnected();
+  }
+
+  /** Captures the mouse (Android 8 and later) when the game wants it, lets it go when not. */
+  private void updateMouseCapture() {
+    if (Build.VERSION.SDK_INT < 26 || surface == null) return;
+    boolean want = mouseWanted();
+    if (want && !surface.hasPointerCapture()) {
+      surface.requestFocus();
+      surface.requestPointerCapture();
+      if (++mouseCaptures <= 20) Log.i(TAG, "mouse: captured (its buttons through the keyboard's mapping, F1 or the "
+          + "app menu's key frees it), sensitivity " + mouseSensitivity);
+    } else if (!want && surface.hasPointerCapture()) {
+      surface.releasePointerCapture();
+    }
+  }
+
+  /** An event of the captured mouse: its buttons as keys (ActionMap.MOUSE_*), its movement camera and aim. */
+  private void capturedMouse(MotionEvent e) {
+    int state = e.getButtonState() & 31;
+    int changed = state ^ mouseButtons;
+    mouseButtons = state;
+    for (int bit = 1; bit <= 16; bit <<= 1) {
+      if ((changed & bit) == 0) continue;
+      int code = ActionMap.mouseButton(bit);
+      boolean down = (state & bit) != 0;
+      if (input.appFunctionOf(code, true) == CoreInput.APP_MENU) {
+        select(down);
+        continue;
+      }
+      input.keyboardKey(e.getDeviceId(), code, down);
+      if (down) {
+        touchControls.controllerUsed();
+        if (controllerLog.firstKey(e.getDeviceId(), code)) {
+          Log.i(TAG, "mouse button " + CoreMenu.keyName(code) + " -> GC " + CoreInput.names(input.keyboardButton(code))
+              + (input.menu() ? " (a game menu)" : ""));
+        }
+      }
+    }
+    int action = e.getActionMasked();
+    if (action == MotionEvent.ACTION_SCROLL) wheel(e);
+    if (action == MotionEvent.ACTION_MOVE || action == MotionEvent.ACTION_HOVER_MOVE) {
+      // relative counts, the batched ones too
+      float dx = e.getX(), dy = e.getY();
+      for (int h = 0; h < e.getHistorySize(); h++) {
+        dx += e.getHistoricalX(h);
+        dy += e.getHistoricalY(h);
+      }
+      if (dx != 0 || dy != 0) {
+        // while aiming the core turns the aim by it, in the binoculars their view (0.99.12), and ignores it
+        // otherwise (runtime/gyro.cpp, wheel_zoom.cpp); the camera's C stick as long
+        // as the mouse moves, but not in the scope or the binoculars, where the C stick zooms (the wheel's job
+        // since 0.99.12: moving the mouse up and down zoomed there)
+        // ("Invert vertical" for the mouse too, 0.99.12: aiming, the scope, the binoculars)
+        // ("Turn Leon with mouse / look area", 1.0: the movement sideways turns Leon too, where he does not aim, and
+        // the camera only looks up and down)
+        float[] turn = input.mouseMoved(dx, dy, MOUSE_AIM_RADIANS * mouseSensitivity, MOUSE_LOOK * mouseSensitivity,
+            aimInvert);
+        CoreBridge.aimTurn(turn[0], turn[1]);
+        if (turn[2] != 0) CoreBridge.bodyTurn(turn[2]);
+        main.removeCallbacks(mouseRest);
+        main.postDelayed(mouseRest, 60);
+      }
+    }
+    send();
+  }
+
+  // ---- the mouse wheel (0.99.12, wish of the project owner, 12.11.2026) ----
+  private int wheelLines, zoomViewLines;
+
+  /**
+   * A turn of the mouse wheel (captured or not): whole notches to the core (CoreInput.wheel), which zooms the
+   * scope and the binoculars by them (up zooms in) and drops them anywhere else.
+   */
+  private void wheel(MotionEvent e) {
+    int notches = input.wheel(e.getAxisValue(MotionEvent.AXIS_VSCROLL));
+    if (notches == 0) return;
+    CoreBridge.zoom(notches);
+    if (wheelLines++ < 20) {
+      Log.i(TAG, "mouse wheel: " + notches + " notch(es) " + (notches > 0 ? "up" : "down")
+          + (input.zoomView() ? " (the scope or the binoculars: zoom)" : " (no scope, no binoculars: nothing)"));
+    }
+  }
+
+  /** The scope or the binoculars came up or went (rumbleTick): the mouse keeps off the C stick while they are up. */
+  private void setZoomView(boolean on) {
+    if (on == input.zoomView()) return;
+    input.setZoomView(on);
+    if (zoomViewLines++ < 40) {
+      Log.i(TAG, "mouse: the scope or the binoculars " + (on ? "up (the wheel zooms, the mouse's movement does not)" : "down"));
+    }
+    if (on) send();
   }
 
   @SuppressWarnings("deprecation")
@@ -870,6 +2815,74 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
     amplitudeControl = vibrator != null && Build.VERSION.SDK_INT >= 26 && vibrator.hasAmplitudeControl();
     Log.i(TAG, vibrator == null ? "rumble: no vibrator"
         : "rumble: vibrator" + (amplitudeControl ? " with amplitude control" : " (on/off only)"));
+    chooseRumble("start");
+  }
+
+  /** A controller's key or stick: when it is another one than before, the rumble's target may change. */
+  private void padUsed(InputDevice d) {
+    if (d == null || d.getId() == lastPad || !gameDevice(d)) return;
+    lastPad = d.getId();
+    chooseRumble("controller used");
+  }
+
+  /**
+   * The rumble's target by the menu's "Vibration" (RumbleTarget) and the controller used last; both vibrators
+   * stopped first, so none runs on after a change. Each new choice goes into the log: which vibrator, with or
+   * without amplitude control.
+   */
+  private void chooseRumble(String why) {
+    cancelBoth();
+    padMotors = null;
+    padAmplitude = false;
+    InputDevice d = lastPad >= 0 ? InputDevice.getDevice(lastPad) : null;
+    VibratorManager m = null;
+    int motors = 0;
+    boolean amplitude = true, external = false;
+    if (Build.VERSION.SDK_INT >= RumbleTarget.PAD_SDK && d != null) {
+      try {
+        m = d.getVibratorManager();
+        int[] ids = m.getVibratorIds();
+        motors = ids.length;
+        for (int id : ids) amplitude &= m.getVibrator(id).hasAmplitudeControl();
+        external = d.isExternal();
+      } catch (RuntimeException e) {
+        Log.w(TAG, "rumble: the controller's motors: " + e);
+        motors = 0;
+      }
+    }
+    rumbleTarget = RumbleTarget.choose(rumbleMode, Build.VERSION.SDK_INT, motors > 0, external, vibrator != null);
+    String line;
+    if (rumbleTarget == RumbleTarget.PAD) {
+      padMotors = m;
+      padAmplitude = amplitude;
+      line = "the controller \"" + d.getName() + "\" (" + motors + (motors == 1 ? " motor" : " motors")
+          + (amplitude ? ", with amplitude control)" : ", on/off only)");
+    } else if (rumbleTarget == RumbleTarget.PHONE) {
+      line = "this device's vibrator" + (amplitudeControl ? " with amplitude control" : " (on/off only)");
+      if (d != null) {
+        line += motors > 0 ? ", not the built-in controller's motors"
+            : Build.VERSION.SDK_INT < RumbleTarget.PAD_SDK ? ", a controller's motors need Android 12"
+            : ", \"" + d.getName() + "\" has no motors";
+      }
+    } else {
+      line = rumbleMode == RumbleTarget.OFF ? "none (switched off)"
+          : "none" + (d == null ? " (no controller used yet)" : ", \"" + d.getName() + "\" has no motors");
+    }
+    line = "rumble (" + RumbleTarget.modeName(rumbleMode) + "): " + line;
+    if (!line.equals(rumbleLine)) Log.i(TAG, line + " [" + why + "]");
+    rumbleLine = line;
+  }
+
+  /** Both vibrators stopped (a target change, the game paused or gone). */
+  private void cancelBoth() {
+    try {
+      if (vibrator != null) vibrator.cancel();
+      if (padMotors != null) padMotors.cancel();
+    } catch (RuntimeException e) {
+      Log.w(TAG, "rumble: cancel: " + e);
+    }
+    vibrating = false;
+    rumbleLevel = 0;
   }
 
   /**
@@ -882,18 +2895,31 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
       if (destroyed || !resumed) return;
       int r = CoreBridge.rumble();
       long now = SystemClock.uptimeMillis();
+      // the game shows a menu (bit 4): the button mappings give way to the devices' defaults
+      boolean gameMenu = (r & 0x10) != 0;
+      if (gameMenu != input.menu()) {
+        input.setMenu(gameMenu);
+        send();
+      }
+      // the scope or the binoculars (bit 6, cores since 12.11.2026): the mouse's movement keeps off the C stick
+      setZoomView((r & 0x40) != 0);
       int frames = r >>> 8;
       if (frames != rumbleFrames) {
         rumbleFrames = frames;
         rumbleSeen = now;
       }
       int level = now - rumbleSeen < 200 ? Integer.bitCount(r & 0xF) : 0;
-      if (level == 0) {
-        stopVibrator();
-      } else if (!vibrating || level != rumbleLevel || now >= rumbleUntil - 40) {
+      // A shot rumbles for 3-5 game frames only (device test 24.10.2026: nothing felt in play, only
+      // the long rumble of the options screen): each start runs its pulse out at least, a stronger
+      // level starts at once, a weaker one waits for the running one; no cancel when it ends.
+      if (now >= rumbleUntil) {
+        vibrating = false;
+        rumbleLevel = 0;
+      }
+      if (level > 0 && (!vibrating || level > rumbleLevel || now >= rumbleUntil - 40)) {
         vibrate(level);
         rumbleLevel = level;
-        rumbleUntil = now + 120;
+        rumbleUntil = now + rumblePulseMs(level);
         vibrating = true;
       }
       main.postDelayed(this, 16);
@@ -902,18 +2928,34 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
 
   @SuppressWarnings("deprecation")
   private void vibrate(int level) {
-    if (vibrator == null) return;
+    if (rumbleTarget == RumbleTarget.PAD && padMotors != null && Build.VERSION.SDK_INT >= RumbleTarget.PAD_SDK) {
+      // the controller's motors, all of them at once; without amplitude control at their default strength: the
+      // pulses' length carries the level, as on a phone without it
+      try {
+        int strength = padAmplitude ? 230 + 25 * level / 4 : VibrationEffect.DEFAULT_AMPLITUDE;
+        padMotors.vibrate(CombinedVibration.createParallel(VibrationEffect.createOneShot(rumblePulseMs(level), strength)),
+            VibrationAttributes.createForUsage(VibrationAttributes.USAGE_MEDIA));
+      } catch (RuntimeException e) {
+        Log.w(TAG, "rumble: the controller: " + e);
+        padMotors = null;
+        rumbleTarget = RumbleTarget.NONE;
+      }
+      return;
+    }
+    if (rumbleTarget != RumbleTarget.PHONE || vibrator == null) return;
     try {
       if (Build.VERSION.SDK_INT >= 26) {
-        int strength = amplitudeControl ? 70 + 185 * level / 4 : VibrationEffect.DEFAULT_AMPLITUDE;
-        VibrationEffect effect = VibrationEffect.createOneShot(120, strength);
+        // a quarter of the game's motor already clearly felt (70 was too weak on the Retroid; 150 and
+        // then 210 still too weak, device tests 27.10.2026: now 230 up to the strongest, and longer)
+        int strength = amplitudeControl ? 230 + 25 * level / 4 : VibrationEffect.DEFAULT_AMPLITUDE;
+        VibrationEffect effect = VibrationEffect.createOneShot(rumblePulseMs(level), strength);
         if (Build.VERSION.SDK_INT >= 33) {
           vibrator.vibrate(effect, VibrationAttributes.createForUsage(VibrationAttributes.USAGE_MEDIA));
         } else {
           vibrator.vibrate(effect, new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_GAME).build());
         }
       } else {
-        vibrator.vibrate(120);
+        vibrator.vibrate(rumblePulseMs(level));
       }
     } catch (RuntimeException e) {
       Log.w(TAG, "rumble: " + e);
@@ -922,7 +2964,8 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
   }
 
   private void stopVibrator() {
-    if (vibrating && vibrator != null) vibrator.cancel();
+    // both, the device's and a controller's (0.99.2)
+    if (vibrating) cancelBoth();
     vibrating = false;
     rumbleLevel = 0;
   }
@@ -930,22 +2973,94 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
   // every vsync of the display while the game is shown: the core's retraces
   // follow it (runtime/vi.cpp), so the pictures do not drift against 60 Hz.
   // A screen faster than 60 Hz has the picture drawn at every n-th vsync only
-  // (FramePacing, GPU step c)
+  // (FramePacing, GPU step c). On the beat's own thread since 0.98.5 (startBeat):
+  // on the UI thread a callback late by a vsync left a picture out, and the UI
+  // thread is most likely late while it redraws the touch controls at each vsync
+  // (a finger moving on them; the tester's Xiaomi at 120 Hz, report 06.11.2026:
+  // 52 instead of 60 pictures a second while they were shown, the renderer
+  // itself not slower; uiTick's line says which thread was late). GLSurfaceView's
+  // requestRender and setRenderMode and CoreBridge.vsync may be called from any thread.
   private final Choreographer.FrameCallback vsyncTick = new Choreographer.FrameCallback() {
     @Override public void doFrame(long frameTimeNanos) {
       if (!resumed) return;
       CoreBridge.vsync(frameTimeNanos);
       if (pacing.vsync(frameTimeNanos) || (!paceLogged && pacing.hz() > 0)) pace();
-      if (pacing.every() > 1 && ++vsyncs % pacing.every() == 0) surface.requestRender();
+      if (pacing.due(frameTimeNanos)) picture.requestRender();
       Choreographer.getInstance().postFrameCallback(this);
     }
   };
+
+  // the UI thread's vsyncs, only watched: every 30 s a line when it or the beat came a vsync
+  // late or more (which thread was late, the touch controls shown meanwhile)
+  private final Choreographer.FrameCallback uiTick = new Choreographer.FrameCallback() {
+    @Override public void doFrame(long frameTimeNanos) {
+      if (!resumed) return;
+      final int n = uiBeat.step(frameTimeNanos);
+      if (touchControls != null && touchControls.shown()) uiShownVsyncs += n;
+      if (uiLogAt == Long.MIN_VALUE) uiLogAt = frameTimeNanos;
+      if (frameTimeNanos - uiLogAt >= 30_000_000_000L) {
+        logBeat((frameTimeNanos - uiLogAt) / 1e9);
+        uiLogAt = frameTimeNanos;
+      }
+      Choreographer.getInstance().postFrameCallback(this);
+    }
+  };
+
+  private void logBeat(double seconds) {
+    final int[] b = pacing.takeCounts(), u = uiBeat.takeCounts();
+    final int shown = uiShownVsyncs;
+    uiShownVsyncs = 0;
+    if (b[1] == 0 && u[1] == 0) return;
+    final double hz = pacing.hz();
+    Log.i(TAG, String.format(Locale.ROOT, "vsync beat (its own thread): %d callbacks in %.0f s, %d late by a vsync or "
+        + "more (%d vsyncs missed); the UI thread %d late (%d missed), the touch controls shown %.0f s",
+        b[0], seconds, b[1], b[2], u[1], u[2], hz > 0 ? shown / hz : 0.0));
+  }
+
+  /** The beat (vsyncTick) on its own thread and the UI thread's watch (uiTick): from onResume. */
+  private void startBeat() {
+    if (beatThread == null) {
+      beatThread = new HandlerThread("RE4-Vsync");
+      beatThread.start();
+      beat = new Handler(beatThread.getLooper());
+      beat.post(() -> {
+        try {
+          Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY);
+        } catch (RuntimeException e) {
+          Log.w(TAG, "vsync beat: priority " + e);
+        }
+      });
+    }
+    beat.post(() -> {
+      Choreographer c = Choreographer.getInstance();
+      c.removeFrameCallback(vsyncTick);
+      c.postFrameCallback(vsyncTick);
+    });
+    Choreographer.getInstance().removeFrameCallback(uiTick);
+    Choreographer.getInstance().postFrameCallback(uiTick);
+  }
+
+  /** onPause: both stop; the next vsync after the pause starts a new interval. */
+  private void stopBeat() {
+    if (beat != null) {
+      beat.post(() -> {
+        Choreographer.getInstance().removeFrameCallback(vsyncTick);
+        pacing.restart();
+      });
+    }
+    Choreographer.getInstance().removeFrameCallback(uiTick);
+    uiBeat.restart();
+    uiLogAt = Long.MIN_VALUE;  // the time away is no part of a window
+  }
 
   /** The screen's rate measured anew (FramePacing): the picture drawn at each vsync or at every n-th. */
   private void pace() {
     paceLogged = true;
     int every = pacing.every();
-    surface.setRenderMode(every > 1 ? GLSurfaceView.RENDERMODE_WHEN_DIRTY : GLSurfaceView.RENDERMODE_CONTINUOUSLY);
+    renderMode = every > 1 ? GLSurfaceView.RENDERMODE_WHEN_DIRTY : GLSurfaceView.RENDERMODE_CONTINUOUSLY;
+    picture.setRenderMode(renderMode);
+    // 0.99.13: the pictures keep this grid on the screen too (each asks for its own vsync)
+    CoreBridge.setPictureEvery(every);
     Log.i(TAG, String.format(Locale.ROOT, "display at %.1f Hz: the picture drawn %s", pacing.hz(),
         every > 1 ? "at every " + every + " vsyncs (the screen stayed faster than 60 Hz)" : "at each vsync"));
   }
@@ -984,29 +3099,250 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
         : Build.VERSION.SDK_INT >= 30 ? ": no 60 Hz mode, asked for 60 pictures a second" : ": no 60 Hz mode"));
   }
 
-  /** The surface's frame rate (Android 11 and later) when the screen was asked for 60 Hz. */
+  /**
+   * The surface's frame rate (Android 11 and later) when the screen was asked for 60 Hz. Since 0.99.9 (frame pacing:
+   * a realme and a 720p phone stayed at 90 Hz although they have a 60 Hz mode) as a fixed source of 60 pictures a
+   * second (FIXED_SOURCE: a video's way, which the system matches more firmly than a game's default), and from Android
+   * 12 with "always switch" (CHANGE_FRAME_RATE_ALWAYS: also when the switch is not seamless, once at the start). A
+   * device that still stays faster is measured as before (FramePacing), the core locks to it where it can (vi.cpp).
+   */
   private void surfaceSixtyHz(Surface s) {
     if (!askSixty || Build.VERSION.SDK_INT < 30) return;
     try {
-      s.setFrameRate(60f, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT);
+      if (Build.VERSION.SDK_INT >= 31)
+        s.setFrameRate(60f, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE, Surface.CHANGE_FRAME_RATE_ALWAYS);
+      else
+        s.setFrameRate(60f, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
+      Log.i(TAG, "surface frame rate: 60, fixed source" + (Build.VERSION.SDK_INT >= 31 ? ", always switch" : ""));
     } catch (RuntimeException e) {
       Log.w(TAG, "surface frame rate: " + e);
     }
   }
 
+  /** The OpenGL ES view (GLSurfaceView, as always): its render thread draws with a GLES 3 context. */
+  private GameSurface.Gl glSurface() {
+    GameSurface.Gl gl = new GameSurface.Gl(this);
+    gl.setEGLContextClientVersion(3);
+    gl.setPreserveEGLContextOnPause(true);
+    gl.setRenderer(new GLSurfaceView.Renderer() {
+      @Override public void onSurfaceCreated(GL10 g, EGLConfig config) { CoreBridge.surfaceCreated(); }
+      @Override public void onSurfaceChanged(GL10 g, int w, int h) { CoreBridge.resize(w, h); }
+      @Override public void onDrawFrame(GL10 g) { CoreBridge.draw(); }
+    });
+    picture = gl;
+    return gl;
+  }
+
+  /** The picture's view: 60 pictures a second on a faster screen, the fingers beside the touch controls. */
+  @SuppressLint("ClickableViewAccessibility")
+  private void surfaceCallbacks(SurfaceView view) {
+    final String kind = view instanceof VulkanSurface ? "Vulkan" : "OpenGL ES";
+    // (each in the log: Home and a turn of the device show in a test's log, report of 08.11.2026)
+    view.getHolder().addCallback(new SurfaceHolder.Callback() {
+      @Override public void surfaceCreated(SurfaceHolder holder) {
+        Log.i(TAG, "picture surface (" + kind + "): made");
+        surfaceSixtyHz(holder.getSurface());
+      }
+      @Override public void surfaceChanged(SurfaceHolder holder, int format, int w, int h) {
+        Log.i(TAG, "picture surface (" + kind + "): " + w + "x" + h + ", format " + format);
+      }
+      @Override public void surfaceDestroyed(SurfaceHolder holder) {
+        Log.i(TAG, "picture surface (" + kind + "): gone");
+      }
+    });
+    // the surface takes the fingers beside the touch controls: Android gives the further fingers
+    // of a touch only to views that took one, so a thumb beside the buttons would block them
+    view.setOnTouchListener((v, e) -> true);
+  }
+
+  /** Vulkan can run here: Android 10 and later with Vulkan 1.1 (the plan's minimum; vulkan-bauplan.md). */
+  boolean vulkanSupported() {
+    return Build.VERSION.SDK_INT >= VULKAN_MIN_SDK
+        && getPackageManager().hasSystemFeature(PackageManager.FEATURE_VULKAN_HARDWARE_VERSION, VULKAN_1_1);
+  }
+
+  /**
+   * Vulkan for this run (port/docs/vulkan-bauplan.md): the menu's choice (GRAPHICS -> Renderer) or the test switch
+   * RE4_GX_API=vulkan, where Vulkan can run; else OpenGL ES. The menu's choice has the crash guard: a start that
+   * ended while Vulkan started goes to OpenGL ES (the player hears it); the test switch always tries.
+   */
+  private boolean chooseVulkan() {
+    SharedPreferences g = getSharedPreferences(GRAPHICS_PREFS, MODE_PRIVATE);
+    final boolean test = settings.contains("RE4_GX_API=vulkan");
+    final boolean chosen = "vulkan".equals(g.getString(RENDERER, "gles"));
+    if (settings.contains("RE4_GX_API=gles")) {
+      rendererLine = "OpenGL ES (test switch)";  // (a comparison run, whatever the menu chose)
+      return false;
+    }
+    if (!test && !chosen) return false;
+    if (!vulkanSupported()) {
+      rendererLine = Build.VERSION.SDK_INT < VULKAN_MIN_SDK
+          ? "OpenGL ES (Vulkan asked for: needs Android 10, this is API " + Build.VERSION.SDK_INT + ")"
+          : "OpenGL ES (Vulkan asked for: the device has no Vulkan 1.1)";
+      Log.w(TAG, "renderer: " + rendererLine);
+      return false;
+    }
+    if (!test && g.getBoolean(VULKAN_STARTING, false)) {
+      // the mark of the last start is still there: how did its process end (VulkanGuard)?
+      final int markPid = g.getInt(VulkanGuard.PID, 0);
+      final long markAt = g.getLong(VulkanGuard.AT, 0);
+      final int unsure = g.getInt(VulkanGuard.UNSURE, 0);
+      final VulkanGuard.Exit end = markPid != 0 ? VulkanGuard.lastExit(this, markPid) : null;
+      final VulkanGuard.Verdict v = VulkanGuard.judge(true, markPid, markAt, Build.VERSION.SDK_INT, end, unsure);
+      Log.i(TAG, "renderer: the crash guard's mark of the last start (pid " + markPid + ", set "
+          + VulkanGuard.time(markAt) + ") was still there: " + v.why);
+      if (v.fallBack) {
+        // that start crashed while Vulkan started (a driver's crash): OpenGL ES, the menu's choice back
+        g.edit().putString(RENDERER, "gles").putBoolean(VULKAN_STARTING, false).putInt(VulkanGuard.UNSURE, 0).commit();
+        rendererLine = "OpenGL ES (the last start with Vulkan ended while Vulkan started)";
+        Log.w(TAG, "renderer: " + rendererLine);
+        main.post(() -> message(getString(R.string.ingame_vulkan_crashed)));
+        return false;
+      }
+      g.edit().putBoolean(VULKAN_STARTING, false).putInt(VulkanGuard.UNSURE, v.unsure ? unsure + 1 : 0).commit();
+    }
+    if (!test && !vulkanMarked) {
+      // (commit: it must be on disk before Vulkan; once a process: a new activity of it is no new start)
+      vulkanMarked = true;
+      g.edit().putBoolean(VULKAN_STARTING, true).putInt(VulkanGuard.PID, Process.myPid())
+          .putLong(VulkanGuard.AT, System.currentTimeMillis()).commit();
+      Log.i(TAG, "renderer: the crash guard's mark set (pid " + Process.myPid() + ")");
+    }
+    rendererLine = test ? "Vulkan (test switch)" : "Vulkan";
+    Log.i(TAG, "renderer: " + rendererLine);
+    return true;
+  }
+
+  /** The crash guard is cleared once Vulkan has drawn for a few seconds (VULKAN_GUARD_PICTURES pictures). */
+  private final Runnable vulkanGuard = new Runnable() {
+    @Override public void run() {
+      if (destroyed || !(surface instanceof VulkanSurface)) return;
+      if (CoreBridge.pictures() >= VULKAN_GUARD_PICTURES && CoreBridge.rendererProblem().isEmpty()) {
+        clearVulkanMark("Vulkan drew " + CoreBridge.pictures() + " pictures");
+        return;
+      }
+      if (++vulkanGuardChecks < 150) main.postDelayed(this, VULKAN_GUARD_MS);
+    }
+  };
+
+  /** The crash guard's mark off (the log says why); nothing when it is not there. */
+  private void clearVulkanMark(String why) {
+    SharedPreferences g = getSharedPreferences(GRAPHICS_PREFS, MODE_PRIVATE);
+    if (!g.getBoolean(VULKAN_STARTING, false)) return;
+    // (commit: the game may end right after)
+    g.edit().putBoolean(VULKAN_STARTING, false).putInt(VulkanGuard.UNSURE, 0).commit();
+    Log.i(TAG, "renderer: the crash guard's mark cleared (" + why + ")");
+  }
+
+  /** The core's settings with the renderer: RE4_GX_API=vulkan for Vulkan, none for OpenGL ES. */
+  static String withRenderer(String coreSettings, boolean vulkan) {
+    StringBuilder out = new StringBuilder();
+    for (String part : coreSettings.split(";")) {
+      if (part.isEmpty() || part.startsWith("RE4_GX_API=")) continue;
+      if (out.length() > 0) out.append(';');
+      out.append(part);
+    }
+    if (vulkan) out.append(out.length() > 0 ? ";" : "").append("RE4_GX_API=vulkan");
+    return out.toString();
+  }
+
+  /**
+   * The Vulkan renderer could not start (VulkanSurface): the picture goes over to OpenGL ES in place (a GLSurfaceView
+   * where the Vulkan surface was; the core sends the whole state again), the player hears it once.
+   */
+  private void vulkanFailed(String problem) {
+    if (destroyed || !(surface instanceof VulkanSurface)) return;
+    rendererLine = "OpenGL ES (Vulkan could not start: " + problem + ")";
+    Log.w(TAG, "renderer: " + rendererLine);
+    // the next start with OpenGL ES at once (the menu shows it); the guard is done
+    getSharedPreferences(GRAPHICS_PREFS, MODE_PRIVATE).edit().putString(RENDERER, "gles")
+        .putBoolean(VULKAN_STARTING, false).apply();
+    VulkanSurface old = (VulkanSurface) surface;
+    ViewGroup root = (ViewGroup) old.getParent();
+    final int at = root.indexOfChild(old);
+    final boolean focused = old.hasFocus();
+    old.stop();
+    GameSurface.Gl gl = glSurface();
+    surface = gl;
+    root.removeView(old);
+    root.addView(gl, at);
+    surfaceCallbacks(gl);
+    if (Build.VERSION.SDK_INT >= 26) {
+      gl.setFocusable(true);
+      gl.setFocusableInTouchMode(true);
+      gl.setOnCapturedPointerListener((v, e) -> {
+        capturedMouse(e);
+        return true;
+      });
+    }
+    if (Build.VERSION.SDK_INT >= 30) gl.requestUnbufferedDispatch(InputDevice.SOURCE_CLASS_JOYSTICK);
+    gl.setRenderMode(renderMode);
+    if (!resumed) gl.onPause();
+    if (focused || menu == null) gl.requestFocus();
+    message(getString(R.string.ingame_vulkan_failed));
+  }
+
+  /** The report's renderer.txt: the renderer of this run, its device and driver. */
+  private String rendererText() {
+    String info;
+    try {
+      info = CoreBridge.rendererInfo();
+    } catch (UnsatisfiedLinkError e) {
+      info = "(" + e.getMessage() + ")";
+    }
+    return "Renderer: " + rendererLine + "\nDevice and driver: " + (info.isEmpty() ? "(no renderer yet)" : info)
+        + "\nAndroid: " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + "), " + Build.MANUFACTURER + " "
+        + Build.MODEL + ", " + Build.HARDWARE + "\n";
+  }
+
+  // The display's turn (0, 90, 180, 270): "sensorLandscape" turns the game by 180 degrees with the device, which is no
+  // configuration change (landscape stays landscape) and changes no surface size; only the display's rotation tells
+  private int displayTurn = -1;
+  private final DisplayManager.DisplayListener displayTurns = new DisplayManager.DisplayListener() {
+    @Override public void onDisplayAdded(int id) {}
+    @Override public void onDisplayRemoved(int id) {}
+    @Override public void onDisplayChanged(int id) { logDisplayTurn(); }
+  };
+
+  private void logDisplayTurn() {
+    final int turn = getWindowManager().getDefaultDisplay().getRotation() * 90;
+    if (turn == displayTurn) return;
+    Log.i(TAG, (displayTurn < 0 ? "display rotation: " : "display rotation changed to ") + turn);
+    displayTurn = turn;
+  }
+
+  @Override
+  protected void onStart() {
+    super.onStart();
+    Log.i(TAG, "activity started");
+  }
+
+  @Override
+  protected void onStop() {
+    Log.i(TAG, "activity stopped");
+    // (an end in the background is no crash of Vulkan's start)
+    clearVulkanMark("the app went to the background");
+    super.onStop();
+  }
+
   @Override
   protected void onResume() {
     super.onResume();
+    Log.i(TAG, "activity resumed");
+    DisplayManager displays = (DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
+    if (displays != null) displays.registerDisplayListener(displayTurns, main);
+    logDisplayTurn();
     hideSystemUi();
-    surface.onResume();
+    picture.onResume();
     resumed = true;
     // the game runs again unless the menu or the touch editor is open (a file picker of the menu came back)
     if (menuSupported && menu == null && !touchEditing) CoreBridge.pause(false, 0);
-    Choreographer.getInstance().removeFrameCallback(vsyncTick);
-    Choreographer.getInstance().postFrameCallback(vsyncTick);
+    startBeat();
     if (gyroAim != null) gyroAim.resume();
     InputManager im = (InputManager) getSystemService(Context.INPUT_SERVICE);
     if (im != null) im.registerInputDeviceListener(this, main);
+    // what was connected before (a Bluetooth keyboard paired before the start): one line each, once
+    for (int id : InputDevice.getDeviceIds()) noteConnected(id);
     if (menu == null && !touchEditing) {
       main.removeCallbacks(rumbleTick);
       main.post(rumbleTick);
@@ -1016,13 +3352,16 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
 
   @Override
   protected void onPause() {
+    Log.i(TAG, "activity paused");
+    DisplayManager displays = (DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
+    if (displays != null) displays.unregisterDisplayListener(displayTurns);
     resumed = false;
     // the game stands while the app is not in front (home screen, a file picker of the menu)
     if (menuSupported) CoreBridge.pause(true, 0);
+    keepGameAimInvert();
     selectDown = false;
     main.removeCallbacks(selectHold);
-    Choreographer.getInstance().removeFrameCallback(vsyncTick);
-    pacing.restart();
+    stopBeat();
     if (gyroAim != null) gyroAim.pause();
     // the sound pauses with the app (the core skips what it played meanwhile)
     audio.stop();
@@ -1031,15 +3370,53 @@ public final class CoreActivity extends Activity implements InputManager.InputDe
     InputManager im = (InputManager) getSystemService(Context.INPUT_SERVICE);
     if (im != null) im.unregisterInputDeviceListener(this);
     releaseAll();
-    surface.onPause();
+    picture.onPause();
     super.onPause();
+  }
+
+  /**
+   * The game's language with the European discs (decision of the project owner, 26.10.2026): the
+   * menu's choice, else the device's (the menu's language) if the discs have it, else English.
+   * 2 English, 3 German, 4 French, 5 Spanish, 6 Italian (pSys->language of the European release).
+   */
+  static int gameLanguage(Context context) {
+    return gameLanguageOf(context.getSharedPreferences(GAME_PREFS, MODE_PRIVATE).getInt(GAME_LANGUAGE, 0));
+  }
+
+  /** The game's language of a menu choice: 2..6 as they are, 0 the device's. */
+  static int gameLanguageOf(int chosen) {
+    if (chosen >= 2 && chosen <= 6) return chosen;
+    switch (Locale.getDefault().getLanguage()) {
+      case "de": return 3;
+      case "fr": return 4;
+      case "es": return 5;
+      case "it": return 6;
+      default: return 2;
+    }
+  }
+
+  /** "language de" / "language ar, right to left": the menu's language (the phone's or the app's own). */
+  private String language() {
+    boolean rtl = getResources().getConfiguration().getLayoutDirection() == View.LAYOUT_DIRECTION_RTL;
+    return "language " + Locale.getDefault().toLanguageTag() + (rtl ? ", right to left" : "");
+  }
+
+  /** A new language keeps the game running (configChanges locale|layoutDirection); the log says so. */
+  @Override
+  public void onConfigurationChanged(Configuration config) {
+    super.onConfigurationChanged(config);
+    String now = language();
+    if (!now.equals(shownLanguage)) Log.i(TAG, "configuration changed, the game keeps running: " + now);
+    shownLanguage = now;
   }
 
   @Override
   protected void onDestroy() {
     destroyed = true;
+    if (thermal != null) thermal.stop();
     if (isFinishing()) CoreLog.stop();
     main.removeCallbacksAndMessages(null);
+    if (beatThread != null) beatThread.quitSafely();
     rooms.shutdownNow();
     super.onDestroy();
   }
